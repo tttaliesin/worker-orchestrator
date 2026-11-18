@@ -4,6 +4,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { Orchestrator } from '../core/orchestrator.mjs';
+import { SCHEMA_VERSION } from '../state/sqlite-store.mjs';
 import { capabilityDescription, hostCallFor, receiptFromHost, observationFromWait, validateProfile } from '../adapters/codex-desktop/index.mjs';
 
 function options(argv) {
@@ -23,7 +24,7 @@ export function main(argv = process.argv.slice(2)) {
   let app;
   try {
     const opts = options(argv);
-    if (opts.command === '--version' || opts.command === 'version') { console.log(JSON.stringify({name:'worker-orchestrator',version:'0.1.0',schemaVersion:1})); return 0; }
+    if (opts.command === '--version' || opts.command === 'version') { console.log(JSON.stringify({name:'worker-orchestrator',version:'0.1.0',schemaVersion:SCHEMA_VERSION})); return 0; }
     if (opts.command === '--help' || !opts.command) { console.log(JSON.stringify({usage:'node dist/cli.mjs <command> --state-dir <absolute-directory> --input <json-file|->',commands:['project','dispatch','record','observe','resolve','verify','accept','archive','status','capabilities'],hostExecution:'The authorized controller performs returned hostCall, then records the real result.'})); return 0; }
     if (opts.command === 'capabilities') { console.log(JSON.stringify({ok:true,...capabilityDescription()})); return 0; }
     const supported = ['project','dispatch','record','observe','resolve','verify','accept','archive','status'];
@@ -37,12 +38,14 @@ export function main(argv = process.argv.slice(2)) {
     app = new Orchestrator(stateDir);
     let hostIssue;
     const recordingHostResult = opts.command === 'record' && Object.hasOwn(input, 'hostResult');
-    if (opts.command === 'record' && Object.hasOwn(input, 'hostResult')) {
-      const snapshot = app.execute('status', {projectId:input.projectId,taskId:input.taskId});
-      const pending = snapshot.task?.pendingAction;
-      if (!pending || pending.id !== input.actionId) throw Object.assign(new Error('Host result must match the current pending action'),{code:'ACTION_MISMATCH'});
+    if (recordingHostResult) {
+      if (input.outcome === 'rejected') throw Object.assign(new Error(
+        'Record confirmed rejection with outcome and evidenceRef, without hostResult'), {code:'INPUT'});
+      const {recordAction} = app.execute('status', {
+        projectId:input.projectId, taskId:input.taskId, actionId:input.actionId
+      });
       let normalized;
-      try { normalized = receiptFromHost(pending, input.hostResult); }
+      try { normalized = receiptFromHost(recordAction, input.hostResult); }
       catch (error) {
         hostIssue = {code:error.code ?? 'HOST_CONTRACT',message:error.message};
         normalized = {outcome:'unknown',receipt:{}};
@@ -61,7 +64,8 @@ export function main(argv = process.argv.slice(2)) {
     let result;
     try { result = app.execute(opts.command, input); }
     catch (error) {
-      if (!recordingHostResult || input.outcome !== 'succeeded') throw error;
+      if (!recordingHostResult || input.outcome !== 'succeeded'
+        || !['WORKER_IDENTITY_CONFLICT', 'INVALID_RECEIPT'].includes(error.code)) throw error;
       // The call may already have had an external effect even when the local
       // domain rejects its receipt (e.g. duplicate worker identity).
       hostIssue = {code:error.code ?? 'HOST_CONTRACT',message:error.message};

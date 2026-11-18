@@ -24,7 +24,11 @@ test('CLI records real envelope shape and gates archive until verification and a
  const planned=run('dispatch',dispatch);assert.equal(planned.code,0);assert.equal(planned.json.hostCall.tool,'mcp__codex_app__create_thread');
  const action=planned.json.action;
  const raw={content:[{type:'text',text:JSON.stringify({threadId:'worker',hostId:'local'})}]};
- const bound=run('record',{projectId:'p',taskId:'t',actionId:action.id,hostResult:raw,evidenceRef:'fixture/create.json'});assert.equal(bound.code,0);
+ const createRecord={projectId:'p',taskId:'t',actionId:action.id,hostResult:raw,evidenceRef:'fixture/create.json'};
+ const bound=run('record',createRecord);assert.equal(bound.code,0);
+ assert.deepEqual(run('record',createRecord),bound);
+ assert.equal(run('record',{...createRecord,hostResult:{threadId:'different',hostId:'local'}}).json.error.code,
+  'ACTION_REPLAY_MISMATCH');
  const scope={projectId:'p',taskId:'t',runId:action.runId};
  assert.notEqual(run('archive',scope).code,0);
  const text=JSON.stringify({runId:action.runId,status:'completed',summary:'done',verification:{status:'not_run',evidenceRefs:[]},pendingRequests:[]});
@@ -34,11 +38,22 @@ test('CLI records real envelope shape and gates archive until verification and a
  assert.equal(run('verify',{...scope,status:'passed',evidenceRefs:['fixture/verified-marker.json']}).code,0);
  assert.equal(run('accept',scope).code,0);
  const archive=run('archive',scope);assert.equal(archive.json.hostCall.arguments.archived,true);
+ const createReplayDuringArchive=run('record',createRecord);
+ assert.equal(createReplayDuringArchive.code,0);
+ assert.equal(createReplayDuringArchive.json.action,null);
+ assert.equal(createReplayDuringArchive.json.task.pendingAction.id,archive.json.action.id);
  assert.equal(run('record',{...scope,actionId:archive.json.action.id,hostResult:{threadId:'worker',archived:true},evidenceRef:'fixture/archive.json'}).code,0);
  const follow=run('dispatch',{...dispatch,requestId:'req-2',prompt:'Follow up'});
  assert.equal(follow.json.action.type,'unarchive');assert.notEqual(follow.json.task.runId,action.runId);assert.equal(follow.json.task.verification.status,'unverified');
- const unarchived=run('record',{projectId:'p',taskId:'t',actionId:follow.json.action.id,hostResult:{threadId:'worker',archived:false},evidenceRef:'fixture/unarchive.json'});
+ const restoreRecord={projectId:'p',taskId:'t',actionId:follow.json.action.id,hostResult:{threadId:'worker',archived:false},evidenceRef:'fixture/unarchive.json'};
+ const unarchived=run('record',restoreRecord);
  assert.equal(unarchived.code,0);assert.equal(unarchived.json.action.type,'send');assert.equal(unarchived.json.hostCall.arguments.threadId,'worker');
+ assert.deepEqual(run('record',restoreRecord),unarchived);
+ const sendRecord={...restoreRecord,actionId:unarchived.json.action.id,hostResult:{threadId:'worker'},evidenceRef:'fixture/send.json'};
+ const sent=run('record',sendRecord);
+ assert.equal(sent.code,0);
+ assert.deepEqual(run('record',sendRecord),sent);
+ assert.deepEqual(run('record',restoreRecord),sent);
 });
 test('unparseable host acknowledgement blocks repeat creation across CLI processes',t=>{
  const {run,dispatch}=fixture(t);const plan=run('dispatch',dispatch).json;
@@ -61,4 +76,91 @@ test('malformed host identity and domain-rejected host receipt both prevent retr
  const collision=run('record',{projectId:'p',taskId:'other',actionId:second.action.id,hostResult:{threadId:'worker',hostId:'local'},evidenceRef:'fixture/collision.json'});
  assert.equal(collision.code,1);assert.equal(collision.json.needsReconciliation,true);
  assert.equal(run('dispatch',{...dispatch,taskId:'other',requestId:'other-1'}).json.hostCall,undefined);
+});
+
+test('CLI accepts an explicit confirmed rejection and keeps a generic host error ambiguous', t => {
+ const {run, dispatch} = fixture(t);
+ const original = run('dispatch', dispatch).json.action;
+ const scope = {projectId: 'p', taskId: 't', actionId: original.id};
+ const hostResult = {isError: true, content: [{type: 'text', text: 'Unclassified host error'}]};
+ const ambiguous = run('record', {...scope, hostResult, evidenceRef: 'fixture/unknown.json'});
+ assert.equal(ambiguous.json.needsReconciliation, true);
+ const changed = {...dispatch, requestId: 'req-2', profile: {...dispatch.profile, model: 'supported'}};
+ assert.equal(run('dispatch', changed).json.error.code, 'TASK_BUSY');
+ const rejection = {...scope, outcome: 'rejected', evidenceRef: 'fixture/explicit-pre-create-denial.json'};
+ assert.equal(run('record', {...rejection, hostResult}).json.error.code, 'INPUT');
+ const confirmed = run('record', rejection);
+ assert.equal(confirmed.code, 0);
+ assert.equal(confirmed.json.task.phase, 'rejected');
+ assert.equal(run('dispatch', dispatch).json.action, null);
+ const retry = run('dispatch', changed);
+ assert.equal(retry.code, 0);
+ assert.equal(retry.json.action.type, 'create');
+ assert.notEqual(retry.json.action.runId, original.runId);
+ assert.equal(run('record', {
+  ...scope, hostResult: {threadId: 'late', hostId: 'local'}, evidenceRef: 'fixture/stale.json'
+ }).json.error.code, 'STALE_RUN');
+ assert.equal(run('dispatch', changed).json.action.id, retry.json.action.id);
+});
+
+function boundWorker(t) {
+ const {run, dispatch} = fixture(t);
+ const action = run('dispatch', dispatch).json.action;
+ const scope = {projectId: 'p', taskId: 't', runId: action.runId};
+ assert.equal(run('record', {...scope, actionId: action.id, hostResult: {threadId: 'worker', hostId: 'local'},
+  evidenceRef: 'fixture/create.json'}).code, 0);
+ const observe = poll => run('observe', {...scope, hostResult: {polls: [poll]}, evidenceRef: 'fixture/wait.json'});
+ const resolve = waitId => run('resolve', {...scope, waitId, evidenceRef: 'fixture/user-resolution.json'});
+ return {run, scope, observe, resolve};
+}
+
+test('one raw observation records mixed waits and acceptance requires resolving each one', t => {
+ const {run, scope, observe, resolve} = boundWorker(t);
+ const result = (cursor, pendingRequests) => ({
+  cursor,
+  thread: {id: 'worker', hostId: 'local', status: {type: 'idle'}},
+  latestTurn: {id: 'turn', status: 'completed'},
+  latestAssistantMessage: {turnId: 'turn', phase: 'final_answer', text: JSON.stringify({
+   runId: scope.runId, status: 'completed', summary: 'Result',
+   verification: {status: 'not_run', evidenceRefs: []}, pendingRequests
+  })}
+ });
+ const requests = [
+  {id: 'approval-1', kind: 'approval', summary: 'Approval needed'},
+  {id: 'input-1', kind: 'input', summary: 'Answer needed'}
+ ];
+ const waiting = observe(result('pending', requests));
+ assert.equal(waiting.code, 0);
+ assert.deepEqual(waiting.json.task.waits.map(({waitId, kind}) => [waitId, kind]),
+  [['approval-1', 'approval'], ['input-1', 'input']]);
+ assert.deepEqual(resolve('approval-1').json.task.waits.map(wait => wait.waitId), ['input-1']);
+ assert.deepEqual(observe(result('another-poll', requests)).json.task.waits.map(wait => wait.waitId), ['input-1']);
+ const completed = observe(result('done', []));
+ assert.equal(completed.json.task.phase, 'review');
+ assert.equal(run('verify', {...scope, status: 'passed', evidenceRefs: ['fixture/verified.json']}).code, 0);
+ assert.equal(run('accept', scope).json.error.code, 'UNRESOLVED_WAITS');
+ assert.equal(run('archive', scope).json.error.code, 'ACCEPTANCE_REQUIRED');
+ assert.equal(resolve('input-1').code, 0);
+ assert.equal(run('accept', scope).code, 0);
+ assert.equal(run('archive', scope).json.action.type, 'archive');
+});
+
+test('an anonymous approval can recur in the same turn after confirmed running', t => {
+ const {observe, resolve} = boundWorker(t);
+ const poll = (cursor, activeFlags) => ({
+  cursor,
+  thread: {id: 'worker', hostId: 'local', status: {type: 'active', activeFlags}},
+  latestTurn: {id: 'same-turn', status: 'inProgress'}
+ });
+ const firstPoll = poll('first-approval', ['waitingOnApproval']);
+ const first = observe(firstPoll).json.task.waits[0];
+ assert.deepEqual(observe(poll('again', ['waitingOnApproval'])).json.task.waits, [first]);
+ assert.equal(resolve(first.waitId).code, 0);
+ assert.equal(observe(poll('resume', [])).json.task.phase, 'running');
+ assert.deepEqual(observe(firstPoll).json.task.waits, []);
+ const second = observe(poll('second-approval', ['waitingOnApproval'])).json.task.waits[0];
+ assert.equal(second.kind, 'approval');
+ assert.notEqual(second.waitId, first.waitId);
+ assert.deepEqual(observe(poll('second-poll', ['waitingOnApproval'])).json.task.waits, [second]);
+ assert.deepEqual(resolve(second.waitId).json.task.waits, []);
 });

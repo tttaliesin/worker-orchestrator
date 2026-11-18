@@ -175,6 +175,11 @@ test('events deduplicate without state or history changes and waits survive comp
   f.observe('waiting_approval', { waitId: 'approval-1' });
   const waiting = f.observe('waiting_input', { waitId: 'input-1' });
   assert.equal(waiting.task.phase, 'waiting');
+  throwsCode(() => f.observe('waiting_approval', { eventId: 'conflicting-batch', waits: [
+    { waitId: 'new-approval', kind: 'approval' },
+    { waitId: 'approval-1', kind: 'input' },
+  ] }), 'WAIT_ID_CONFLICT');
+  assert.deepEqual(f.task(), waiting.task);
   assert.deepEqual(waiting.task.waits.map(wait => [wait.id, wait.kind]),
     [['approval-1', 'approval'], ['input-1', 'input']]);
   const beforeHistory = f.db(db => db.prepare('SELECT count(*) AS n FROM history').get().n);
@@ -447,7 +452,7 @@ test('worker identity is unique across tasks and confirmed receipts cannot be ov
   throwsCode(() => f.record(second.action), 'ACTION_NOT_FOUND');
 });
 
-test('reopening retains task/event/history and only one version-one schema migration', t => {
+test('reopening retains task, events, and history without reapplying migrations', t => {
   const f = fixture(t);
   f.complete();
   const before = f.core.execute('status', { projectId: 'p1' });
@@ -457,7 +462,7 @@ test('reopening retains task/event/history and only one version-one schema migra
   f.core = f.open();
   assert.deepEqual(f.core.execute('status', { projectId: 'p1' }), before);
   f.db(db => {
-    assert.deepEqual(db.prepare('SELECT version FROM schema_migrations').all().map(row => row.version), [1]);
+    assert.deepEqual(db.prepare('SELECT version FROM schema_migrations ORDER BY version').all().map(row => row.version), [1, 2]);
     assert.equal(db.prepare('SELECT count(*) AS n FROM events').get().n, 1);
     assert.ok(db.prepare('SELECT count(*) AS n FROM history').get().n >= 6);
     const saved = JSON.parse(db.prepare('SELECT json FROM requests').get().json);
@@ -468,6 +473,71 @@ test('reopening retains task/event/history and only one version-one schema migra
   assert.equal(existsSync(f.projectRoot), true);
   throwsCode(() => f.core.execute('delete', f.input()), 'UNKNOWN_COMMAND');
   assert.deepEqual(f.core.execute('status', { projectId: 'p1' }), before);
+});
+
+test('migrating a V1 database preserves a pending create and allows recovery after confirmed rejection', t => {
+  const f = fixture(t);
+  const first = f.dispatch().action;
+  const failure = { outcome: 'failed', receipt: null, evidenceRef: 'host:unconfirmed-error' };
+  f.record(first, failure);
+  f.core.close();
+  f.db(db => {
+    db.exec(`
+      ALTER TABLE actions RENAME TO actions_v2_fixture;
+      CREATE TABLE actions (
+        action_id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        type TEXT NOT NULL CHECK (type IN ('create', 'send', 'archive', 'unarchive')),
+        outcome TEXT NOT NULL CHECK (outcome IN ('planned', 'succeeded', 'failed', 'unknown')),
+        json TEXT NOT NULL,
+        record_json TEXT,
+        FOREIGN KEY (project_id, task_id) REFERENCES tasks(project_id, task_id)
+      );
+      INSERT INTO actions SELECT * FROM actions_v2_fixture;
+      DROP TABLE actions_v2_fixture;
+      CREATE UNIQUE INDEX one_pending_action_per_task
+        ON actions(project_id, task_id) WHERE outcome != 'succeeded';
+      DELETE FROM schema_migrations WHERE version = 2;
+    `);
+  });
+  f.core = f.open();
+  assert.deepEqual(f.task().pendingAction, first);
+  assert.equal(f.task().needsReconciliation, true);
+  assert.equal(f.db(db => db.prepare('SELECT outcome FROM actions').get().outcome), 'failed');
+  throwsCode(() => f.dispatch({ requestId: 'corrected' }), 'TASK_BUSY');
+  throwsCode(() => f.record(first, { outcome: 'rejected' }), 'INVALID_REJECTION');
+
+  const rejection = { outcome: 'rejected', receipt: null, evidenceRef: 'host:validation-before-create' };
+  const closed = f.record(first, rejection);
+  assert.equal(closed.task.phase, 'rejected');
+  assert.equal(closed.task.workerRef, null);
+  assert.equal(closed.needsReconciliation, false);
+  assert.equal(closed.action, null);
+  assert.deepEqual(f.record(first, rejection), closed);
+  throwsCode(() => f.record(first), 'ACTION_REPLAY_MISMATCH');
+  throwsCode(() => f.observe('running'), 'RUN_FINISHED');
+  assert.equal(f.dispatch().action, null);
+
+  const corrected = { requestId: 'corrected', profile: { ...requestedProfile, model: 'supported-model' } };
+  f.core.execute('project', { ...f.projectInput, authorization: {
+    ...f.projectInput.authorization, createWorkers: false
+  } });
+  throwsCode(() => f.dispatch(corrected), 'AUTHORIZATION_REQUIRED');
+  f.core.execute('project', { ...f.projectInput, authorization: {
+    ...f.projectInput.authorization, sendFollowups: false
+  } });
+  const retry = f.dispatch(corrected).action;
+  assert.equal(retry.type, 'create');
+  assert.notEqual(retry.id, first.id);
+  assert.notEqual(retry.runId, first.runId);
+  assert.equal(f.dispatch(corrected).action.id, retry.id);
+  assert.equal(f.dispatch().action, null);
+  assert.equal(f.record(retry).task.phase, 'running');
+  assert.equal(f.db(db => db.prepare('SELECT count(*) AS n FROM tasks').get().n), 1);
+  assert.deepEqual(f.db(db => db.prepare('SELECT outcome FROM actions ORDER BY rowid').all().map(row => row.outcome)),
+    ['rejected', 'succeeded']);
 });
 
 const contenderSource = `
@@ -518,7 +588,8 @@ test('six cold-start processes sharing SQLite produce one run and one planned cr
     assert.equal(new Set(outputs.map(output => output.result.action.id)).size, 1);
     assert.equal(new Set(outputs.map(output => output.result.task.runId)).size, 1);
     f.db(db => {
-      for (const table of ['schema_migrations', 'projects', 'tasks', 'requests', 'actions']) {
+      assert.equal(db.prepare('SELECT count(*) AS n FROM schema_migrations').get().n, 2);
+      for (const table of ['projects', 'tasks', 'requests', 'actions']) {
         assert.equal(db.prepare(`SELECT count(*) AS n FROM ${table}`).get().n, 1, table);
       }
     });

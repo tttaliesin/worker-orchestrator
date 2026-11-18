@@ -12,6 +12,7 @@ node <설치 루트>/dist/cli.mjs capabilities
 `--input -`는 stdin의 JSON 객체를 읽습니다.
 `--state-dir`를 생략하면 Windows에서 `%LOCALAPPDATA%/WorkerOrchestrator/state`를 사용합니다.
 설치 검증은 항상 임시 절대 경로를 `--state-dir`로 지정합니다.
+상태 명령이 기존 v1 SQLite 데이터베이스를 열면 저장된 기록을 보존하며 v2를 적용합니다.
 CLI는 JSON 결과를 stdout으로 출력합니다.
 오류는 `ok: false`와 종료 코드로 확인합니다.
 
@@ -63,6 +64,8 @@ CLI는 JSON 결과를 stdout으로 출력합니다.
 워커 프롬프트에 해당 `runId`와 설치된 worker 스킬 경로를 전달합니다.
 
 실제 호스트 호출 후 `record`로 결과를 기록합니다.
+기록 응답을 받지 못했으면 같은 `actionId`와 `hostResult`로 `record`를 다시 호출합니다.
+복원 기록을 다시 제출하면 아직 결과가 기록되지 않은 후속 `send`의 기존 action ID를 받을 수 있습니다.
 다음 예시는 원문 호스트 결과를 `host-result.json`에 보존한 경우입니다.
 
 ```powershell
@@ -84,8 +87,10 @@ $InputObject | ConvertTo-Json -Depth 40 -Compress |
 보관·복원 receipt에는 동일한 `workerRef`와 `archived: true|false`가 필요합니다.
 결과를 모르면 `outcome: unknown`과 실제 근거를 기록합니다.
 불명확한 생성은 확인 전에 다시 보내지 않습니다.
-생성 실패로 보류된 action은 같은 호출의 성공을 확인할 수 있을 때 대조해 기록합니다.
-생성 작업이 실행 전에 거절됐음을 확인한 경우에는 보류를 종료하는 별도 명령이 없습니다.
+생성 전에 도구가 요청을 확정 거절했다는 증거를 확보하면 같은 action을 `outcome: rejected`와 `evidenceRef`로 기록합니다.
+이 입력에는 `hostResult`와 성공 receipt를 생략합니다.
+상태가 `rejected`가 되면 같은 `taskId`에 새 `requestId`와 수정한 입력으로 `dispatch`합니다.
+일반 오류와 시간 초과는 생성 여부를 확인할 때까지 대조 대기로 유지합니다.
 
 진행은 공식 `wait_threads`로 관찰합니다.
 세부 근거가 필요하면 `read_thread`를 사용합니다.
@@ -109,8 +114,11 @@ $InputObject | ConvertTo-Json -Depth 40 -Compress |
 정규화한 입력을 직접 작성할 때 `eventId`는 같은 작업의 실행 전체에서 고유해야 합니다.
 승인 대기는 `status: waiting_approval`과 `waitId`를 기록합니다.
 사용자 입력 대기는 `status: waiting_input`과 `waitId`를 기록합니다.
-대기 요청이 여러 개면 각 요청의 실제 식별자를 사용해 `observe`로 개별 기록합니다.
-실제 승인이나 답변을 확인한 후 `resolve`로 같은 `waitId`를 해제합니다.
+대기 요청 여러 개를 직접 기록할 때는 `waits: [{waitId, kind}]`를 전달합니다.
+첫 항목의 `kind`가 `approval`이면 `waiting_approval`을 사용하고, `input`이면 `waiting_input`을 사용합니다.
+원문 wait 응답에 여러 요청이 있으면 한 관찰에서 함께 기록합니다.
+각 요청의 실제 승인이나 답변을 확인한 뒤 `task.waits`에 반환된 해당 `waitId`를 `resolve`로 해제합니다.
+호스트가 요청 ID 없이 대기 상태만 제공하면 재개가 관찰된 뒤 같은 턴에 생긴 대기를 새 요청으로 기록합니다.
 
 다음 표는 나머지 명령의 정확한 입력입니다.
 `p`, `t`, `r`는 각각 실제 `projectId`, `taskId`, `runId`입니다.

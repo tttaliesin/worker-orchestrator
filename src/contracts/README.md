@@ -9,9 +9,14 @@ CLI는 대화 도구 호출 계획을 출력하고 실제 호스트 호출은 �
 `dispatch` 입력은 `projectId`, `taskId`, `requestId`, `prompt`, `profile: {model, thinking}`를 받습니다.
 `record` 입력은 `projectId`, `taskId`, `actionId`, `outcome`과 `receipt`, `evidenceRef`를 받습니다.
 `record`에 Codex 도구의 원문 `hostResult`를 주면 CLI의 호스트 어댑터가 receipt로 변환합니다.
+같은 실행에서 동일 action의 확정 결과를 다시 기록하면 기존 상태와 현재 권한 범위의 후속 계획을 반환합니다.
+`outcome: rejected`는 호스트가 실행 전에 `create`를 거절했음이 확인됐을 때 증거 참조와 함께 사용합니다.
+거절된 실행은 종료되며 같은 작업에 새 `requestId`로 생성 계획을 요청할 수 있습니다.
 `observe` 입력은 `projectId`, `taskId`, `runId`, `eventId`, `status`, `evidenceRef`를 받습니다.
 status는 `running`, `waiting_approval`, `waiting_input`, `completed`, `failed`, `unknown`입니다.
-대기 시 `waitId`, 완료 시 `result: {success, summary}`를 포함합니다.
+대기 시 `waitId` 또는 `waits: [{waitId, kind}]`를 포함합니다.
+`kind`는 `approval` 또는 `input`이며 대기 상태는 배열의 첫 항목에 대응합니다.
+완료 시 `result: {success, summary}`를 포함합니다.
 `resolve` 입력은 `projectId`, `taskId`, `runId`, `waitId`, `evidenceRef`를 받습니다.
 `verify` 입력은 `projectId`, `taskId`, `runId`, `status: passed|failed`, `evidenceRefs`를 받습니다.
 검증 대상 결과의 `task.result.eventId`를 `resultEventId`로 전달할 수 있습니다.

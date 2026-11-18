@@ -15,6 +15,7 @@ const PERMISSIONS = {
 };
 const OBSERVATIONS = new Set(['running', 'waiting_approval', 'waiting_input',
   'completed', 'failed', 'unknown']);
+const WAIT_KINDS = { waiting_approval: 'approval', waiting_input: 'input' };
 
 function object(value, name) {
   check(value !== null && typeof value === 'object' && !Array.isArray(value),
@@ -82,10 +83,16 @@ export class Orchestrator {
       const project = this.store.project(projectId);
       check(project, 'PROJECT_NOT_FOUND', `Project is not registered: ${projectId}`);
       if (command === 'status') {
-        if (payload.taskId === undefined) return { project, tasks: this.store.tasks(projectId) };
+        if (payload.taskId === undefined && payload.actionId === undefined) {
+          return { project, tasks: this.store.tasks(projectId) };
+        }
         const task = this.getTask(projectId, text(payload.taskId, 'taskId'));
-        // Status exposes pendingAction for receipt normalization but issues no host action.
-        return this.response(project, task, false);
+        const snapshot = this.response(project, task, false);
+        if (payload.actionId !== undefined) {
+          const row = this.getAction(task, text(payload.actionId, 'actionId'));
+          snapshot.recordAction = JSON.parse(row.json);
+        }
+        return snapshot;
       }
       text(payload.taskId, 'taskId');
       if (command === 'dispatch') return this.dispatch(project, payload);
@@ -140,6 +147,13 @@ export class Orchestrator {
     const task = this.store.task(projectId, taskId);
     check(task, 'TASK_NOT_FOUND', `Task does not exist: ${taskId}`);
     return task;
+  }
+
+  getAction(task, actionId) {
+    const row = this.store.action(task.projectId, task.taskId, actionId);
+    check(row, 'ACTION_NOT_FOUND', 'No action with that id belongs to this task.');
+    this.currentRun(task, row.run_id);
+    return row;
   }
 
   currentRun(task, runId) {
@@ -204,10 +218,12 @@ export class Orchestrator {
         && !['planned', 'running', 'waiting'].includes(task.phase),
         'TASK_BUSY', 'The task already has an active run or pending action.');
       check(task.waits.length === 0, 'UNRESOLVED_WAITS', 'Resolve all waits before starting another run.');
-      check(task.workerRef, 'INVALID_STATE', 'An existing task must retain its worker identity.');
+      check(task.workerRef || task.phase === 'rejected', 'INVALID_STATE',
+        'An existing task must retain its worker identity unless creation was rejected.');
     }
-    this.authorize(project, task ? 'send' : 'create');
-    if (task?.archived) this.authorize(project, 'unarchive');
+    const actionType = task?.workerRef ? task.archived ? 'unarchive' : 'send' : 'create';
+    this.authorize(project, task?.workerRef ? 'send' : 'create');
+    if (actionType === 'unarchive') this.authorize(project, actionType);
     const runId = randomUUID();
     const now = new Date().toISOString();
     const existed = Boolean(task);
@@ -225,7 +241,7 @@ export class Orchestrator {
     this.store.db.prepare(`INSERT INTO requests(project_id, task_id, request_id, run_id, prompt, profile_json, json)
       VALUES (?, ?, ?, ?, ?, ?, ?)`)
       .run(task.projectId, task.taskId, requestId, runId, prompt, JSON.stringify(requestedProfile), JSON.stringify(task));
-    this.planAction(project, task, existed ? task.archived ? 'unarchive' : 'send' : 'create');
+    this.planAction(project, task, actionType);
     this.store.saveTask(task);
     this.store.history('dispatch', input, project, task);
     return this.response(project, task);
@@ -233,39 +249,42 @@ export class Orchestrator {
 
   record(project, task, input) {
     const actionId = text(input.actionId, 'actionId');
-    check(['succeeded', 'failed', 'unknown'].includes(input.outcome),
-      'INVALID_INPUT', 'outcome must be succeeded, failed, or unknown.');
+    const { outcome } = input;
+    check(['succeeded', 'failed', 'unknown', 'rejected'].includes(outcome),
+      'INVALID_INPUT', 'outcome must be succeeded, failed, unknown, or rejected.');
     text(input.evidenceRef, 'evidenceRef');
-    const row = this.store.db.prepare(`SELECT * FROM actions WHERE action_id = ?
-      AND project_id = ? AND task_id = ?`).get(actionId, task.projectId, task.taskId);
-    check(row, 'ACTION_NOT_FOUND', 'No action with that id belongs to this task.');
-    this.currentRun(task, row.run_id);
+    const row = this.getAction(task, actionId);
     if (input.runId !== undefined) this.currentRun(task, text(input.runId, 'runId'));
     const action = JSON.parse(row.json);
-    const recorded = { outcome: input.outcome, receipt: input.receipt ?? null, evidenceRef: input.evidenceRef };
-    if (row.outcome === 'succeeded') {
+    const recorded = { outcome, receipt: input.receipt ?? null, evidenceRef: input.evidenceRef };
+    if (row.outcome === 'succeeded' || row.outcome === 'rejected') {
       // An old receipt cannot apply to a later action in the same run.
       check(isDeepStrictEqual(JSON.parse(row.record_json).receipt, recorded.receipt)
-        && input.outcome === 'succeeded',
+        && outcome === row.outcome,
       'ACTION_REPLAY_MISMATCH', 'An already confirmed action cannot be overwritten.');
-      return this.response(project, task);
+      const resumeSend = action.type === 'unarchive' && task.pendingAction?.type === 'send'
+        && project.authorization[PERMISSIONS.send] === true;
+      return this.response(project, task, resumeSend);
     }
     check(task.pendingAction?.id === actionId, 'STALE_ACTION', 'The action is no longer pending.');
     if (row.record_json && isDeepStrictEqual(JSON.parse(row.record_json), recorded)) return this.response(project, task);
-    if (input.outcome === 'succeeded') {
-      this.applyReceipt(project, task, action, input.receipt);
-      this.store.db.prepare('UPDATE actions SET outcome = ?, record_json = ? WHERE action_id = ?')
-        .run('succeeded', JSON.stringify(recorded), actionId);
+    if (outcome === 'succeeded') this.applyReceipt(project, task, action, input.receipt);
+    if (outcome === 'rejected') {
+      check(action.type === 'create' && !task.workerRef && recorded.receipt === null, 'INVALID_REJECTION',
+        'Rejection requires a confirmed pre-execution create denial with no success receipt.');
+      task.phase = 'rejected';
+      task.hostStatus = 'rejected';
+    }
+    this.store.db.prepare('UPDATE actions SET outcome = ?, record_json = ? WHERE action_id = ?')
+      .run(outcome, JSON.stringify(recorded), actionId);
+
+    const terminal = outcome === 'succeeded' || outcome === 'rejected';
+    task.needsReconciliation = !terminal;
+    if (terminal) {
       task.pendingAction = null;
-      task.needsReconciliation = false;
       if (action.type === 'unarchive' && project.authorization[PERMISSIONS.send] === true) {
         this.planAction(project, task, 'send');
       }
-    } else {
-      // A failed create is also blocked: absence of a receipt is not proof of no worker.
-      this.store.db.prepare('UPDATE actions SET outcome = ?, record_json = ? WHERE action_id = ?')
-        .run(input.outcome, JSON.stringify(recorded), actionId);
-      task.needsReconciliation = true;
     }
     this.store.saveTask(task);
     this.store.history('record', input, project, task);
@@ -317,22 +336,19 @@ export class Orchestrator {
         'The observation ID already belongs to a different run of this task.');
       return this.response(project, task, false);
     }
-    check(task.phase !== 'complete', 'RUN_FINISHED', 'An accepted run is immutable.');
+    check(task.phase !== 'complete' && task.phase !== 'rejected', 'RUN_FINISHED',
+      'An accepted or rejected run is immutable.');
     check(!task.pendingAction && task.phase !== 'planned',
       'PENDING_ACTION', 'Confirm dispatch before observing its run.');
+    const previousHostStatus = task.hostStatus;
     task.hostStatus = input.status;
     task.needsReconciliation = input.status === 'unknown';
     task.verification = unverified(task.runId);
     task.accepted = false;
     task.resultReviewed = false;
-    if (input.status === 'waiting_approval' || input.status === 'waiting_input') {
-      const id = text(input.waitId, 'waitId');
-      const kind = input.status === 'waiting_approval' ? 'approval' : 'input';
-      const existing = task.waits.find(wait => wait.id === id);
-      check(!existing || existing.kind === kind, 'WAIT_ID_CONFLICT', 'A wait id cannot change kind.');
-      check(!task.resolvedWaits.some(wait => wait.id === id), 'WAIT_ID_CONFLICT', 'A resolved wait id cannot be reopened.');
-      if (!existing) task.waits.push({ id, waitId: id, kind, runId: task.runId, evidenceRef: input.evidenceRef });
-      if (task.phase !== 'review') task.phase = 'waiting';
+    if (Object.hasOwn(WAIT_KINDS, input.status)) {
+      this.observeWaits(task, input, previousHostStatus);
+      if (task.phase !== 'review') task.phase = task.waits.length ? 'waiting' : 'running';
     } else if (input.status === 'completed') {
       const result = object(input.result, 'result');
       check(typeof result.success === 'boolean', 'INVALID_INPUT', 'result.success must be an explicit boolean.');
@@ -360,6 +376,37 @@ export class Orchestrator {
     this.store.saveTask(task);
     this.store.history('observe', input, project, task);
     return this.response(project, task, false);
+  }
+
+  observeWaits(task, input, previousHostStatus) {
+    const primaryKind = WAIT_KINDS[input.status];
+    const inBatch = input.waits !== undefined;
+    const entries = inBatch ? input.waits : [{ waitId: input.waitId, kind: primaryKind }];
+    check(Array.isArray(entries) && entries.length > 0, 'INVALID_INPUT', 'waits must be a nonempty array.');
+    check(entries[0]?.kind === primaryKind && (input.waitId === undefined || input.waitId === entries[0].waitId),
+      'INVALID_INPUT', 'The wait status and waitId must match the first wait.');
+    for (const entry of entries) {
+      object(entry, 'wait');
+      const sourceId = text(entry.waitId, 'wait.waitId');
+      const { kind, anonymous } = entry;
+      check(kind === 'approval' || kind === 'input', 'INVALID_INPUT', 'wait.kind must be approval or input.');
+      check(anonymous === undefined || typeof anonymous === 'boolean', 'INVALID_INPUT', 'wait.anonymous must be a boolean.');
+      const matches = wait => (anonymous ? wait.sourceWaitId ?? wait.id : wait.id) === sourceId;
+      const existing = task.waits.find(matches);
+      const resolved = task.resolvedWaits.find(matches);
+      check((!existing || existing.kind === kind) && (!resolved || resolved.kind === kind),
+        'WAIT_ID_CONFLICT', 'A wait id cannot change kind.');
+      if (existing) continue;
+      if (resolved && !inBatch) {
+        throw new OrchestratorError('WAIT_ID_CONFLICT', 'A resolved wait id cannot be reopened.');
+      }
+      // Host flags without request IDs can recur during one turn. Only a new running
+      // observation separates a resolved flag from the next occurrence of that flag.
+      if (resolved && (!anonymous || previousHostStatus !== 'running')) continue;
+      const id = resolved ? randomUUID() : sourceId;
+      task.waits.push({ id, waitId: id, kind, runId: task.runId, evidenceRef: input.evidenceRef,
+        ...(anonymous ? { sourceWaitId: sourceId } : {}) });
+    }
   }
 
   resolve(project, task, input) {

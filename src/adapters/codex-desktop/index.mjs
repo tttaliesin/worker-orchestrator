@@ -145,43 +145,64 @@ function readFinalResult(message, turnId, runId) {
   return result;
 }
 
+function readWaitingFlag(flag) {
+  const type = typeof flag === 'string' ? flag : flag?.type;
+  if (typeof type !== 'string') return;
+
+  let kind;
+  if (/approval/i.test(type)) kind = 'approval';
+  else if (/input|question/i.test(type)) kind = 'input';
+  else return;
+
+  const id = [flag?.requestId, flag?.id].find(value => isNonemptyText(value) || Number.isFinite(value));
+  return {kind, waitId: id === undefined ? undefined : String(id)};
+}
+
+function normalizeWaits(pendingRequests, flags, turnOrRunId) {
+  const waits = pendingRequests.map(({id, kind}) => ({waitId: id, kind}));
+  const hostWaits = flags.map(readWaitingFlag).filter(Boolean);
+  // A flag without an ID only establishes that a wait of this kind exists.
+  const representedKinds = new Set([...waits, ...hostWaits.filter(wait => wait.waitId)].map(wait => wait.kind));
+  for (const {kind, waitId} of hostWaits) {
+    if (waitId) {
+      if (!waits.some(wait => wait.kind === kind && wait.waitId === waitId)) waits.push({waitId, kind});
+    } else if (!representedKinds.has(kind)) {
+      waits.push({waitId: `codex:${turnOrRunId}:waiting_${kind}`, kind, anonymous: true});
+      representedKinds.add(kind);
+    }
+  }
+  return waits;
+}
+
 export function observationFromWait(raw, workerRef, runId, evidenceRef) {
   const payload = unwrapHostResult(raw);
   const poll = payload.polls?.find(x => x.thread?.id === workerRef.threadId && (!workerRef.hostId || !x.thread.hostId || x.thread.hostId === workerRef.hostId));
   if (!poll) throw new HostContractError('HOST_CONTRACT', 'Wait result does not contain the selected worker');
   const turn = poll.latestTurn;
-  const flags = poll.thread.status?.activeFlags ?? [];
-  const flagNames = flags.map(x => typeof x === 'string' ? x : x.type);
-  let status = 'unknown';
-  if (flagNames.some(x => /approval/i.test(x))) status = 'waiting_approval';
-  else if (flagNames.some(x => /input|question/i.test(x))) status = 'waiting_input';
-  else if (turn?.status === 'completed') status = 'completed';
-  else if (turn?.status === 'failed' || turn?.status === 'interrupted') status = 'failed';
-  else if (poll.thread.status?.type === 'active' || turn?.status === 'inProgress') status = 'running';
+  const threadStatus = poll.thread.status;
+  const hostCursor = poll.cursor;
+  const hostTurnId = turn?.id ?? null;
   const message = poll.latestAssistantMessage;
   // A previous finished turn is still visible immediately after a new dispatch.
-  // Bind completion to the run carried by the worker's structured final result.
-  let finalResult;
-  if (status === 'completed' || status === 'failed') {
-    const hostFailed = status === 'failed';
-    finalResult = readFinalResult(message, turn?.id, runId);
-    if (!finalResult) status = 'unknown';
-    else if (finalResult.pendingRequests.length) {
-      status = finalResult.pendingRequests[0].kind === 'approval' ? 'waiting_approval' : 'waiting_input';
-    } else status = hostFailed ? 'failed' : finalResult.status;
-  }
-  const waitId = status.startsWith('waiting_')
-    ? finalResult?.pendingRequests[0]?.id ?? `codex:${turn?.id ?? runId}:${status}`
-    : undefined;
+  // Bind worker requests and results to the current run before using either.
+  const finalResult = readFinalResult(message, hostTurnId, runId);
+  const waits = normalizeWaits(finalResult?.pendingRequests ?? [], threadStatus?.activeFlags ?? [], hostTurnId ?? runId);
+  const firstWait = waits[0];
+
+  let status = 'unknown';
+  if (firstWait) status = `waiting_${firstWait.kind}`;
+  else if (turn?.status === 'completed') status = finalResult?.status ?? 'unknown';
+  else if (turn?.status === 'failed' || turn?.status === 'interrupted') {
+    if (finalResult) status = 'failed';
+  } else if (threadStatus?.type === 'active' || turn?.status === 'inProgress') status = 'running';
+
   const result = status === 'completed' || status === 'failed'
     ? {success: status === 'completed' && !turn?.error, summary: message.text}
     : undefined;
-  const hostCursor = poll.cursor;
-  const hostTurnId = turn?.id ?? null;
-  // The same host cursor can carry a compact snapshot or the final message.
+  // A cursor can carry different request lists or a more complete final snapshot.
   const evidenceKey = [runId, workerRef.hostId, workerRef.threadId, hostCursor, hostTurnId,
-    status, waitId, result?.success, finalResult ? message.text : null];
+    status, firstWait ? waits : undefined, result?.success, finalResult ? message.text : null];
   const eventId = `codex:${createHash('sha256').update(JSON.stringify(evidenceKey)).digest('hex')}`;
   return {runId, eventId, status, evidenceRef,
-    ...(waitId ? {waitId} : {}), ...(result ? {result} : {}), hostCursor, hostTurnId};
+    ...(firstWait ? {waitId: firstWait.waitId, waits} : {}), ...(result ? {result} : {}), hostCursor, hostTurnId};
 }

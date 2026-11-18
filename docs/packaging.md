@@ -24,10 +24,16 @@ Git revision을 얻지 못하면 `revision`은 `null`입니다.
 node <설치 루트>/scripts/check-package.mjs --state-dir <임시 절대 경로>
 ```
 
+`capabilities`로 설치된 CLI의 시작과 어댑터를 확인합니다.
+이어 해당 상태 디렉터리에서 `status`를 실행합니다.
+등록되지 않은 프로젝트의 `PROJECT_NOT_FOUND` 응답으로 SQLite 열기·마이그레이션·조회가 완료됐는지 확인합니다.
+
 빌드는 정해진 출력 파일만 덮어씁니다.
 이전 파일이나 외부 파일을 재귀 삭제하지 않습니다.
 검사기는 manifest에 없는 잔여 파일을 실패로 보고합니다.
 소스와 출력의 symlink는 패키지에 포함하지 않습니다.
+같은 catalog 출력 경로에 대한 빌드는 순차적으로 파일을 기록합니다.
+빌드와 같은 catalog를 검사할 때는 기록이 끝난 패키지와 catalog를 확인합니다.
 
 배포용 catalog 루트에는 `marketplace.json`을 생성합니다.
 같은 내용은 공식 탐색 위치인 `.agents/plugins/marketplace.json`에도 생성합니다.

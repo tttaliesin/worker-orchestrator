@@ -54,6 +54,9 @@ node <설치 루트>/dist/cli.mjs capabilities
 계획만으로 호스트 성공을 기록하지 않습니다.
 생성 결과를 알 수 없으면 `outcome: unknown`으로 남깁니다.
 실제 생성 여부를 확인하기 전에는 생성을 다시 보내지 않습니다.
+호스트가 생성 시작 전에 요청을 확정 거절했으면 같은 action의 `outcome: rejected`와 실제 근거를 기록합니다.
+거절이 기록되면 같은 작업에 새 `requestId`로 수정된 요청을 계획할 수 있습니다.
+기록 응답을 받지 못했으면 같은 `action.id`와 원문 응답을 `record`에 다시 전달합니다.
 
 워커 프롬프트에는 `action.runId`와 [워커 스킬](../worker-executor/SKILL.md)의 설치 경로를 전달합니다.
 프롬프트에는 프로젝트와 파일 소유 범위도 전달합니다.
@@ -64,5 +67,6 @@ node <설치 루트>/dist/cli.mjs capabilities
 관련 상세 증거가 필요할 때 `read_thread`를 사용합니다.
 승인이나 사용자 입력을 컨트롤러가 대신 처리하지 않습니다.
 `waiting_approval`과 `waiting_input` 상태에서는 보관하지 않습니다.
+실제 사용자 처리를 확인한 요청마다 `task.waits`의 해당 ID를 사용해 해제합니다.
 동일 실행에 대한 `verify: passed`와 `accept`가 끝나야 보관을 계획합니다.
 보관된 대화의 후속 작업은 같은 대화를 복원한 다음 새 실행을 전달합니다.

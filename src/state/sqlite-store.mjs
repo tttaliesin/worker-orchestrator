@@ -70,6 +70,29 @@ const MIGRATION_V1 = `
   CREATE INDEX history_by_task ON history(project_id, task_id, id);
 `;
 
+const MIGRATION_V2 = `
+  CREATE TABLE actions_v2 (
+    action_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    type TEXT NOT NULL CHECK (type IN ('create', 'send', 'archive', 'unarchive')),
+    outcome TEXT NOT NULL CHECK (outcome IN ('planned', 'succeeded', 'failed', 'unknown', 'rejected')),
+    json TEXT NOT NULL,
+    record_json TEXT,
+    FOREIGN KEY (project_id, task_id) REFERENCES tasks(project_id, task_id)
+  );
+  INSERT INTO actions_v2(action_id, project_id, task_id, run_id, type, outcome, json, record_json)
+    SELECT action_id, project_id, task_id, run_id, type, outcome, json, record_json FROM actions;
+  DROP TABLE actions;
+  ALTER TABLE actions_v2 RENAME TO actions;
+  CREATE UNIQUE INDEX one_pending_action_per_task
+    ON actions(project_id, task_id) WHERE outcome NOT IN ('succeeded', 'rejected');
+`;
+
+const migrations = [MIGRATION_V1, MIGRATION_V2];
+export const SCHEMA_VERSION = migrations.length;
+
 /** All read/modify/write commands hold one cross-process SQLite write lock. */
 export class SQLiteStore {
   constructor(stateDir) {
@@ -88,12 +111,13 @@ export class SQLiteStore {
           version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL
         )`);
         const versions = this.db.prepare('SELECT version FROM schema_migrations ORDER BY version').all();
-        requireCondition(versions.every(row => row.version === 1), 'UNSUPPORTED_SCHEMA',
+        requireCondition(versions.length <= SCHEMA_VERSION && versions.every((row, index) => row.version === index + 1),
+          'UNSUPPORTED_SCHEMA',
           'The state database has an unsupported schema version.');
-        if (versions.length === 0) {
-          this.db.exec(MIGRATION_V1);
-          this.db.prepare('INSERT INTO schema_migrations(version, applied_at) VALUES(1, ?)')
-            .run(new Date().toISOString());
+        for (let version = versions.length + 1; version <= SCHEMA_VERSION; version += 1) {
+          this.db.exec(migrations[version - 1]);
+          this.db.prepare('INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)')
+            .run(version, new Date().toISOString());
         }
       });
     } catch (error) {
@@ -145,6 +169,11 @@ export class SQLiteStore {
   request(projectId, taskId, requestId) {
     return this.db.prepare('SELECT * FROM requests WHERE project_id = ? AND task_id = ? AND request_id = ?')
       .get(projectId, taskId, requestId);
+  }
+
+  action(projectId, taskId, actionId) {
+    return this.db.prepare('SELECT * FROM actions WHERE project_id = ? AND task_id = ? AND action_id = ?')
+      .get(projectId, taskId, actionId) ?? null;
   }
 
   saveTask(task, { insert = false } = {}) {

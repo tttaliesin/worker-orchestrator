@@ -1,14 +1,68 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { lstat, mkdtemp, readFile, readdir } from 'node:fs/promises';
+import { lstat, mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const scriptParent = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const portableSchema = 'https://agent-plugins.org/schemas/1.0.0/plugin.schema.json';
+
+async function hasOutputLock(filename) {
+  try {
+    const stat = await lstat(filename);
+    assert.ok(stat.isFile() && !stat.isSymbolicLink() && stat.size === 0, `Expected an empty regular build lock file: ${filename}`);
+    return true;
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    return false;
+  }
+}
+
+export async function withBuildOutputLock(outputRoot, action, { readOnly = false } = {}) {
+  const filename = path.join(outputRoot, '.worker-orchestrator-build.sqlite');
+  if (!readOnly) {
+    try {
+      await writeFile(filename, '', { flag: 'wx' });
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+    }
+    assert.ok(await hasOutputLock(filename), `Missing build lock: ${filename}`);
+  } else if (!await hasOutputLock(filename)) {
+    // Older builds have no lock file. Retry under the lock if a rebuild created one during the check.
+    try {
+      const result = await action();
+      if (!await hasOutputLock(filename)) return result;
+    } catch (error) {
+      if (!await hasOutputLock(filename)) throw error;
+    }
+  }
+
+  // SQLite holds OS locks on the empty file and releases them even if a process exits abruptly.
+  const { DatabaseSync } = await import('node:sqlite');
+  const db = new DatabaseSync(filename, { readOnly });
+  try {
+    if (readOnly) db.exec('BEGIN');
+    const acquire = readOnly ? 'SELECT name FROM sqlite_schema' : 'PRAGMA journal_mode = MEMORY; BEGIN EXCLUSIVE';
+    const deadline = performance.now() + 30_000;
+    for (;;) {
+      try {
+        db.exec(acquire);
+        break;
+      } catch (error) {
+        if (error.errcode !== 5) throw error; // SQLITE_BUSY
+        if (performance.now() >= deadline) throw new Error(`Timed out waiting for package build lock: ${filename}`, { cause: error });
+        await delay(25);
+      }
+    }
+    return await action();
+  } finally {
+    db.close();
+  }
+}
 
 function contained(root, candidate) {
   const relative = path.relative(root, candidate);
@@ -126,10 +180,29 @@ async function checkMarketplace(marketplaceRoot, packageRoot, name) {
   assert.deepEqual(await readJSON(path.join(marketplaceRoot, catalogs[1])), first, 'Marketplace copies must match.');
 }
 
-/** Checks the installed tree using only files contained in that tree and Node builtins. */
+function runInstalled(root, command, stateDir, input) {
+  const args = [path.join(root, 'dist/cli.mjs'), command, '--state-dir', stateDir];
+  if (input !== undefined) args.push('--input', '-');
+  const result = spawnSync(process.execPath, args, { cwd: root, encoding: 'utf8', input: JSON.stringify(input), windowsHide: true, timeout: 30_000 });
+  assert.equal(result.error, undefined, `Installed CLI ${command} could not start: ${result.error?.message}`);
+  return result;
+}
+
+function isInstalled() {
+  return existsSync(path.join(scriptParent, 'package-manifest.json')) || existsSync(path.join(scriptParent, 'dist/cli.mjs'));
+}
+
+/** Checks a standalone install or a package in its build catalog. */
 export async function checkPackage({ root, marketplaceRoot, smoke = true, stateDir } = {}) {
   assert.ok(Number(process.versions.node.split('.')[0]) >= 24, 'Package requires Node.js 24 or newer.');
-  root = path.resolve(root ?? (existsSync(path.join(scriptParent, 'package-manifest.json')) ? scriptParent : path.join(scriptParent, 'dist/codex/worker-orchestrator')));
+  root = path.resolve(root ?? (isInstalled() ? scriptParent : path.join(scriptParent, 'dist/codex/worker-orchestrator')));
+  const outputRoot = path.dirname(root);
+  const check = () => checkInstalledPackage(root, marketplaceRoot, smoke, stateDir);
+  if (path.relative(path.join(outputRoot, 'worker-orchestrator'), root)) return check();
+  return withBuildOutputLock(outputRoot, check, { readOnly: true });
+}
+
+async function checkInstalledPackage(root, marketplaceRoot, smoke, stateDir) {
   const files = new Set(await regularFiles(root));
   const manifest = await readJSON(path.join(root, 'package-manifest.json'));
   assert.equal(manifest.formatVersion, 1);
@@ -201,16 +274,22 @@ export async function checkPackage({ root, marketplaceRoot, smoke = true, stateD
 
   let capabilities = null;
   if (smoke) {
-    // Always pass a throwaway absolute state path, including commands that currently do not open state.
     stateDir = path.resolve(stateDir ?? await mkdtemp(path.join(os.tmpdir(), 'worker-orchestrator-check-')));
-    const result = spawnSync(process.execPath, [path.join(root, 'dist/cli.mjs'), 'capabilities', '--state-dir', stateDir], { cwd: root, encoding: 'utf8', windowsHide: true, timeout: 30_000 });
-    assert.equal(result.error, undefined, `Installed CLI could not start: ${result.error?.message}`);
+    const result = runInstalled(root, 'capabilities', stateDir);
     assert.equal(result.status, 0, `Installed CLI capabilities failed: ${result.stderr}\n${result.stdout}`);
     capabilities = JSON.parse(result.stdout);
     assert.equal(capabilities.ok, true);
     assert.equal(capabilities.adapter, 'codex-desktop');
     assert.equal(capabilities.execution, 'controller-mediated');
     assert.ok(['create', 'send', 'archive', 'unarchive', 'wait', 'observe'].every(value => capabilities.supports?.includes(value)));
+
+    // This error is returned only after opening, migrating, and querying SQLite.
+    const status = runInstalled(root, 'status', stateDir, { projectId: `package-smoke-${randomUUID()}` });
+    const statusFailure = `Installed CLI SQLite status failed: ${status.stderr}\n${status.stdout}`;
+    assert.equal(status.status, 2, statusFailure);
+    const response = JSON.parse(status.stdout);
+    assert.equal(response.ok, false, statusFailure);
+    assert.equal(response.error?.code, 'PROJECT_NOT_FOUND', statusFailure);
   }
   return { ok: true, root, version: manifest.version, revision: manifest.revision, files: expected.length, skills: [...skillNames].sort(), marketplaceChecked: Boolean(marketplaceRoot), capabilities };
 }
@@ -225,7 +304,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
       options[key] = args[index + 1];
       if (key === 'stateDir') assert.ok(path.isAbsolute(options[key]), '--state-dir must be absolute.');
     }
-    if (!options.root && !existsSync(path.join(scriptParent, 'package-manifest.json'))) options.marketplaceRoot ??= path.join(scriptParent, 'dist/codex');
+    if (!options.root && !isInstalled()) options.marketplaceRoot ??= path.join(scriptParent, 'dist/codex');
     console.log(JSON.stringify(await checkPackage(options), null, 2));
   } catch (error) {
     console.error(JSON.stringify({ ok: false, error: error.message }));

@@ -1,8 +1,9 @@
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { lstat, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, open, readFile, readdir, rename, rm, rmdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { withBuildOutputLock } from '../../scripts/check-package.mjs';
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const portableSchema = 'https://agent-plugins.org/schemas/1.0.0/plugin.schema.json';
@@ -15,13 +16,19 @@ async function ensureDirectory(directory) {
   const absolute = path.resolve(directory);
   const parent = path.dirname(absolute);
   if (parent !== absolute) await ensureDirectory(parent);
+  let stat;
   try {
-    const stat = await lstat(absolute);
-    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`Refusing non-directory or symlink: ${absolute}`);
+    stat = await lstat(absolute);
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
-    await mkdir(absolute);
+    try {
+      await mkdir(absolute);
+    } catch (mkdirError) {
+      if (mkdirError.code !== 'EEXIST') throw mkdirError;
+    }
+    stat = await lstat(absolute);
   }
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`Refusing non-directory or symlink: ${absolute}`);
 }
 
 async function readTree(directory, prefix) {
@@ -46,7 +53,7 @@ async function readRegular(filename) {
   return readFile(filename);
 }
 
-async function writeOwned(root, relative, data) {
+async function ownedTarget(root, relative) {
   const target = path.resolve(root, relative);
   const scope = path.relative(root, target);
   if (!scope || scope.startsWith(`..${path.sep}`) || scope === '..' || path.isAbsolute(scope)) throw new Error(`Output escapes package root: ${relative}`);
@@ -57,7 +64,36 @@ async function writeOwned(root, relative, data) {
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
   }
-  await writeFile(target, data);
+  return target;
+}
+
+async function publishFiles(outputRoot, files, manifest) {
+  const stage = await mkdtemp(path.join(outputRoot, '.worker-orchestrator-stage-'));
+  const staged = [];
+  let published = 0;
+  try {
+    for (const [relative, data] of [...files, manifest]) {
+      const target = await ownedTarget(outputRoot, relative);
+      const source = path.join(stage, String(staged.length));
+      const handle = await open(source, 'wx');
+      staged.push({ source, target });
+      try {
+        await handle.writeFile(data);
+      } finally {
+        await handle.close();
+      }
+    }
+
+    // All targets and bytes are ready. A failed publish must leave no valid-looking old manifest.
+    await rm(staged.at(-1).target, { force: true });
+    for (const { source, target } of staged) {
+      await rename(source, target);
+      published++;
+    }
+  } finally {
+    for (const { source } of staged.slice(published)) await rm(source, { force: true });
+    await rmdir(stage);
+  }
 }
 
 function revisionFor(root) {
@@ -109,11 +145,10 @@ export async function buildPackage({ repoRoot = repositoryRoot, outputRoot = pat
   }
   if (!files.has('lib/cli/main.mjs')) throw new Error('src/cli/main.mjs is required before building.');
 
-  // Overwrite only known build files; leave stale or foreign files for the checker to report.
-  await ensureDirectory(packageRoot);
+  const outputFiles = new Map();
   const hashes = {};
   for (const [relative, data] of [...files].sort(([a], [b]) => a.localeCompare(b, 'en'))) {
-    await writeOwned(packageRoot, relative, data);
+    outputFiles.set(`worker-orchestrator/${relative}`, data);
     hashes[relative] = { sha256: createHash('sha256').update(data).digest('hex'), bytes: data.length };
   }
   const manifest = {
@@ -124,7 +159,6 @@ export async function buildPackage({ repoRoot = repositoryRoot, outputRoot = pat
     runtime: { name: 'node', range: metadata.engines.node, builtWith: process.versions.node },
     files: hashes,
   };
-  await writeOwned(packageRoot, 'package-manifest.json', json(manifest));
 
   const marketplace = {
     name: 'worker-orchestrator-local',
@@ -135,9 +169,13 @@ export async function buildPackage({ repoRoot = repositoryRoot, outputRoot = pat
       policy: { installation: 'AVAILABLE', authentication: 'ON_INSTALL' },
     }],
   };
-  await writeOwned(outputRoot, 'marketplace.json', json(marketplace));
+  outputFiles.set('marketplace.json', json(marketplace));
   // Official directory registration discovers this conventional location beneath outputRoot.
-  await writeOwned(outputRoot, '.agents/plugins/marketplace.json', json(marketplace));
+  outputFiles.set('.agents/plugins/marketplace.json', json(marketplace));
+
+  // Overwrite only known build files; leave stale or foreign files for the checker to report.
+  await ensureDirectory(outputRoot);
+  await withBuildOutputLock(outputRoot, () => publishFiles(outputRoot, outputFiles, ['worker-orchestrator/package-manifest.json', json(manifest)]));
   return { ok: true, packageRoot, marketplaceRoot: outputRoot, files: files.size, version: manifest.version, revision: manifest.revision };
 }
 

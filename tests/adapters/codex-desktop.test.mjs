@@ -16,6 +16,11 @@ const completedResult = {
 const finalMessage = result => ({
   text: JSON.stringify(result), turnId: terminalPoll.latestTurn.id, phase: 'final_answer'
 });
+const activeThread = (...activeFlags) => ({
+  ...terminalPoll.thread, status: {type: 'active', activeFlags}
+});
+const observePoll = (poll, evidenceRef = 'evidence') =>
+  observationFromWait({polls: [poll]}, workerRef, 'r', evidenceRef);
 
 test('creates a local project conversation with explicit execution settings',()=>{
  const call=hostCallFor(action); assert.equal(call.arguments.target.projectId,'desktop-p'); assert.equal(call.arguments.model,'test-model');assert.equal(call.arguments.thinking,'high');assert.match(call.arguments.prompt,/runId: r/);
@@ -78,7 +83,84 @@ test('a completed model turn with failed work or pending questions is not succes
   const waiting = observe({...completedResult, pendingRequests: [{id: 'question-1', kind: 'input', summary: 'Answer required'}]});
   assert.equal(waiting.status, 'waiting_input');
   assert.equal(waiting.waitId, 'question-1');
+  assert.deepEqual(waiting.waits, [{waitId: 'question-1', kind: 'input'}]);
   assert.equal(waiting.result, undefined);
+});
+test('keeps worker requests in source order and adds distinct host waits', () => {
+  const poll = {
+    ...terminalPoll,
+    thread: activeThread('waitingOnApproval', {type: 'waitingOnApproval', requestId: 'approval-1'},
+      'waitingOnUserInput', {type: 'waitingOnUserInput', id: 'host-input'}),
+    latestAssistantMessage: finalMessage({...completedResult, pendingRequests: [
+      {id: 'question-1', kind: 'input', summary: 'First question'},
+      {id: 'approval-1', kind: 'approval', summary: 'Approval required'},
+      {id: 'question-2', kind: 'input', summary: 'Second question'}
+    ]})
+  };
+  const observation = observePoll(poll);
+  assert.deepEqual(observation.waits, [
+    {waitId: 'question-1', kind: 'input'},
+    {waitId: 'approval-1', kind: 'approval'},
+    {waitId: 'question-2', kind: 'input'},
+    {waitId: 'host-input', kind: 'input'}
+  ]);
+  assert.equal(observation.status, 'waiting_input');
+  assert.equal(observation.waitId, 'question-1');
+  assert.equal(observation.result, undefined);
+});
+test('uses explicit flag IDs and suppresses anonymous flags of the same kind', () => {
+  const observation = observePoll({...terminalPoll, thread: activeThread(
+    'waitingOnApproval',
+    {type: 'waitingOnUserInput', requestId: 'host-question', id: 'flag-id'},
+    {type: 'waitingOnApproval', requestId: 0},
+    {type: 'waitingOnApproval', requestId: '', id: 'next-approval'}
+  )});
+  assert.deepEqual(observation.waits, [
+    {waitId: 'host-question', kind: 'input'},
+    {waitId: '0', kind: 'approval'},
+    {waitId: 'next-approval', kind: 'approval'}
+  ]);
+  assert.equal(observation.status, 'waiting_input');
+  assert.equal(observation.waitId, 'host-question');
+});
+test('keeps anonymous wait IDs stable across snapshots and distinguishes their observations', () => {
+  const poll = {...terminalPoll, thread: activeThread('waitingOnApproval',
+    {type: 'waitingOnUserInput'}, 'waitingOnApproval')};
+  const observation = observePoll(poll);
+  assert.deepEqual(observation.waits, [
+    {waitId: 'codex:turn-1:waiting_approval', kind: 'approval', anonymous: true},
+    {waitId: 'codex:turn-1:waiting_input', kind: 'input', anonymous: true}
+  ]);
+  assert.equal(observation.status, 'waiting_approval');
+  assert.equal(observation.waitId, observation.waits[0].waitId);
+  assert.equal(observePoll({...poll, changed: false}, 'replay').eventId, observation.eventId);
+
+  const laterSnapshot = observePoll({...poll, cursor: 'c3'});
+  assert.deepEqual(laterSnapshot.waits, observation.waits);
+  assert.notEqual(laterSnapshot.eventId, observation.eventId);
+
+  const approvalOnly = observePoll({...poll, thread: activeThread('waitingOnApproval')});
+  assert.equal(approvalOnly.hostCursor, observation.hostCursor);
+  assert.equal(approvalOnly.waitId, observation.waitId);
+  assert.notEqual(approvalOnly.eventId, observation.eventId);
+
+  const laterTurn = observePoll({...poll, latestTurn: {...poll.latestTurn, id: 'turn-2'}});
+  assert.deepEqual(laterTurn.waits.map(wait => wait.waitId), [
+    'codex:turn-2:waiting_approval', 'codex:turn-2:waiting_input'
+  ]);
+});
+test('ignores stale worker requests when the host reports attention', () => {
+  const observation = observePoll({
+    ...terminalPoll,
+    thread: activeThread('waitingOnApproval'),
+    latestAssistantMessage: finalMessage({...completedResult, runId: 'old-run', pendingRequests: [
+      {id: 'old-approval', kind: 'approval', summary: 'Prior run approval'},
+      {id: 'old-question', kind: 'input', summary: 'Prior run question'}
+    ]})
+  });
+  assert.deepEqual(observation.waits, [
+    {waitId: 'codex:turn-1:waiting_approval', kind: 'approval', anonymous: true}
+  ]);
 });
 test('malformed or nonfinal worker replies cannot become terminal results', () => {
   const request = {id: 'approval-1', kind: 'approval', summary: 'Approval required'};
