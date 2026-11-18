@@ -65,6 +65,9 @@ node <설치 루트>/dist/cli.mjs capabilities
 
 관찰은 `wait_threads`의 커서와 워커의 `threadId`, `hostId`를 보존합니다.
 관련 상세 증거가 필요할 때 `read_thread`를 사용합니다.
+`observe`가 `read_thread`의 `hostCall`을 반환하면 해당 읽기 전용 호출을 바로 실행합니다.
+같은 `observe` 입력에 실제 조회 응답 `readThreadResult`와 근거 참조 `readThreadEvidenceRef`를 추가해 다시 호출합니다.
+원문으로 확인된 결과도 같은 실행의 검증과 채택을 거칩니다.
 승인이나 사용자 입력을 컨트롤러가 대신 처리하지 않습니다.
 `waiting_approval`과 `waiting_input` 상태에서는 보관하지 않습니다.
 실제 사용자 처리를 확인한 요청마다 `task.waits`의 해당 ID를 사용해 해제합니다.

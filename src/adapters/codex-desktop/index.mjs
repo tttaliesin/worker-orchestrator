@@ -3,6 +3,8 @@ import { createHash } from 'node:crypto';
 const THINKING = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
 const RESULT_STATUSES = new Set(['running', 'waiting_approval', 'waiting_input', 'completed', 'failed', 'unknown']);
 const VERIFICATION_STATUSES = new Set(['passed', 'failed', 'not_run', 'unknown']);
+const TERMINAL_TURN_STATUSES = new Set(['completed', 'failed', 'interrupted']);
+const JSON_DECODE_FAILED = Symbol('JSON_DECODE_FAILED');
 
 export class HostContractError extends Error {
   constructor(code, message) { super(message); this.name = 'HostContractError'; this.code = code; }
@@ -129,7 +131,7 @@ function readFinalResult(message, turnId, runId) {
   try {
     result = JSON.parse(message.text.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, ''));
   } catch {
-    return;
+    return JSON_DECODE_FAILED;
   }
   if (!hasExactKeys(result, ['runId', 'status', 'summary', 'verification', 'pendingRequests'])
     || !isNonemptyText(result.runId) || result.runId !== runId
@@ -143,6 +145,34 @@ function readFinalResult(message, turnId, runId) {
       && isNonemptyText(request.id) && (request.kind === 'approval' || request.kind === 'input')
       && isNonemptyText(request.summary))) return;
   return result;
+}
+
+function recoverFinalResult(readBack, workerRef, compactTurn, messageId, runId) {
+  if (!isNonemptyText(readBack?.evidenceRef)) return;
+
+  let payload;
+  try {
+    payload = unwrapHostResult(readBack.hostResult);
+  } catch {
+    return;
+  }
+  const {thread, turns} = payload;
+  if (thread?.id !== workerRef.threadId || thread?.hostId !== workerRef.hostId || payload.truncated === true
+    || !Array.isArray(turns) || turns.length !== 1) return;
+
+  const [turn] = turns;
+  if (turn?.id !== compactTurn.id || turn.status !== compactTurn.status || turn.truncated === true
+    || !Array.isArray(turn.items)) return;
+
+  const messages = turn.items.filter(item => item?.id === messageId);
+  const [message] = messages;
+  if (messages.length !== 1 || message.type !== 'agentMessage' || message.phase !== 'final_answer'
+    || message.truncated === true) return;
+
+  const result = readFinalResult(message, turn.id, runId);
+  const activeFlags = thread.status?.activeFlags ?? [];
+  if (!result || result === JSON_DECODE_FAILED || !Array.isArray(activeFlags)) return;
+  return {turn, message, result, activeFlags};
 }
 
 function readWaitingFlag(flag) {
@@ -174,35 +204,56 @@ function normalizeWaits(pendingRequests, flags, turnOrRunId) {
   return waits;
 }
 
-export function observationFromWait(raw, workerRef, runId, evidenceRef) {
+export function observationFromWait(raw, workerRef, runId, evidenceRef, readBack) {
   const payload = unwrapHostResult(raw);
-  const poll = payload.polls?.find(x => x.thread?.id === workerRef.threadId && (!workerRef.hostId || !x.thread.hostId || x.thread.hostId === workerRef.hostId));
-  if (!poll) throw new HostContractError('HOST_CONTRACT', 'Wait result does not contain the selected worker');
-  const turn = poll.latestTurn;
-  const threadStatus = poll.thread.status;
-  const hostCursor = poll.cursor;
-  const hostTurnId = turn?.id ?? null;
-  const message = poll.latestAssistantMessage;
+  const workerPolls = payload.polls?.filter(poll => poll?.thread?.id === workerRef.threadId) ?? [];
+  const normalPoll = workerPolls.find(poll => poll.thread.hostId === workerRef.hostId)
+    ?? workerPolls.find(poll => !poll.thread.hostId);
+  // A poll under a different host can supply correlation keys for a read on the registered host.
+  const poll = normalPoll ?? (workerPolls.length === 1 ? workerPolls[0] : undefined);
+  const compactTurn = poll?.latestTurn;
+  const compactMessage = poll?.latestAssistantMessage;
+  const hostTurnId = compactTurn?.id ?? null;
   // A previous finished turn is still visible immediately after a new dispatch.
   // Bind worker requests and results to the current run before using either.
-  const finalResult = readFinalResult(message, hostTurnId, runId);
-  const waits = normalizeWaits(finalResult?.pendingRequests ?? [], threadStatus?.activeFlags ?? [], hostTurnId ?? runId);
+  const compactResult = readFinalResult(compactMessage, hostTurnId, runId);
+  const canRecover = compactResult === JSON_DECODE_FAILED && TERMINAL_TURN_STATUSES.has(compactTurn?.status)
+    && isNonemptyText(workerRef.hostId) && isNonemptyText(hostTurnId)
+    && compactMessage.turnId === hostTurnId && isNonemptyText(compactMessage.id)
+    && (poll.latestAssistantMessageId == null || poll.latestAssistantMessageId === compactMessage.id);
+  if (!normalPoll && !canRecover) throw new HostContractError('HOST_CONTRACT', 'Wait result does not contain the selected worker');
+
+  const readThread = canRecover && readBack === undefined
+    ? {threadId: workerRef.threadId, hostId: workerRef.hostId, turnLimit: 1, includeOutputs: false, maxOutputCharsPerItem: 12000}
+    : undefined;
+  const recovered = canRecover ? recoverFinalResult(readBack, workerRef, compactTurn, compactMessage.id, runId) : undefined;
+  const finalResult = recovered?.result ?? (compactResult === JSON_DECODE_FAILED ? undefined : compactResult);
+  const message = recovered?.message ?? compactMessage;
+  const turn = recovered?.turn ?? compactTurn;
+  const threadStatus = normalPoll?.thread.status;
+  const hostCursor = normalPoll?.cursor;
+  const flags = [...(threadStatus?.activeFlags ?? []), ...(recovered?.activeFlags ?? [])];
+  const waits = normalizeWaits(finalResult?.pendingRequests ?? [], flags, hostTurnId ?? runId);
   const firstWait = waits[0];
 
   let status = 'unknown';
   if (firstWait) status = `waiting_${firstWait.kind}`;
   else if (turn?.status === 'completed') status = finalResult?.status ?? 'unknown';
-  else if (turn?.status === 'failed' || turn?.status === 'interrupted') {
+  else if (TERMINAL_TURN_STATUSES.has(turn?.status)) {
     if (finalResult) status = 'failed';
   } else if (threadStatus?.type === 'active' || turn?.status === 'inProgress') status = 'running';
 
   const result = status === 'completed' || status === 'failed'
     ? {success: status === 'completed' && !turn?.error, summary: message.text}
     : undefined;
-  // A cursor can carry different request lists or a more complete final snapshot.
-  const evidenceKey = [runId, workerRef.hostId, workerRef.threadId, hostCursor, hostTurnId,
+  // A compact decode failure identifies a message across cursor and host alias changes.
+  const snapshotKey = canRecover
+    ? ['read_thread', hostTurnId, compactTurn.status, compactMessage.id]
+    : [hostCursor, hostTurnId];
+  const evidenceKey = [runId, workerRef.hostId, workerRef.threadId, ...snapshotKey,
     status, firstWait ? waits : undefined, result?.success, finalResult ? message.text : null];
   const eventId = `codex:${createHash('sha256').update(JSON.stringify(evidenceKey)).digest('hex')}`;
-  return {runId, eventId, status, evidenceRef,
-    ...(firstWait ? {waitId: firstWait.waitId, waits} : {}), ...(result ? {result} : {}), hostCursor, hostTurnId};
+  return {runId, eventId, status, evidenceRef: recovered ? readBack.evidenceRef : evidenceRef,
+    ...(firstWait ? {waitId: firstWait.waitId, waits} : {}), ...(result ? {result} : {}),
+    ...(readThread ? {readThread} : {}), hostCursor, hostTurnId};
 }

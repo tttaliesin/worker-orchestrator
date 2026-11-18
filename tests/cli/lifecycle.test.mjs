@@ -164,3 +164,74 @@ test('an anonymous approval can recur in the same turn after confirmed running',
  assert.deepEqual(observe(poll('second-poll', ['waitingOnApproval'])).json.task.waits, [second]);
  assert.deepEqual(resolve(second.waitId).json.task.waits, []);
 });
+
+test('wait JSON with a collapsed Windows path escape recovers the exact Desktop message', t => {
+ const {run, scope} = boundWorker(t);
+ const backslash = String.fromCharCode(92);
+ const original = JSON.stringify({
+  runId: scope.runId,
+  status: 'completed',
+  summary: ['marker cwd=F:', 'workspace', 'project', 'worker-orchestrator'].join(backslash),
+  verification: {status: 'passed', evidenceRefs: ['fixture/marker.json']},
+  pendingRequests: []
+ });
+ // The Desktop wait summary dropped one escape per Windows path separator.
+ const compact = original.replaceAll(backslash.repeat(2), backslash);
+ assert.throws(() => JSON.parse(compact), SyntaxError);
+ const input = {
+  ...scope,
+  evidenceRef: 'fixture/wait.json',
+  hostResult: {polls: [{
+   cursor: 'cursor:2',
+   thread: {id: 'worker', hostId: 'remote-control:fixture', status: {type: 'idle'}},
+   latestTurn: {id: 'turn-reused', status: 'completed', error: null},
+   latestAssistantMessage: {id: 'final-reused', turnId: 'turn-reused', phase: 'final_answer', text: compact}
+  }]}
+ };
+ const lookup = run('observe', input);
+ assert.equal(lookup.code, 0);
+ assert.equal(lookup.json.task.hostStatus, 'unknown');
+ assert.equal(lookup.json.needsReconciliation, true);
+ assert.equal(lookup.json.action, null);
+ assert.equal(lookup.json.hostCall.tool, 'mcp__codex_app__read_thread');
+ assert.equal(lookup.json.hostCall.arguments.threadId, 'worker');
+ assert.equal(lookup.json.hostCall.arguments.hostId, 'local');
+ assert.equal(run('archive', scope).json.error.code, 'ACCEPTANCE_REQUIRED');
+
+ const read = (messageId) => ({
+  thread: {id: 'worker', hostId: 'local', status: {type: 'idle'}},
+  turns: [{
+   id: 'turn-reused',
+   status: 'completed',
+   items: [{id: messageId, type: 'agentMessage', phase: 'final_answer', text: original}]
+  }]
+ });
+ const wrong = run('observe', {
+  ...input, readThreadResult: read('different-message'), readThreadEvidenceRef: 'fixture/different-message.json'
+ });
+ assert.equal(wrong.code, 0);
+ assert.equal(wrong.json.task.hostStatus, 'unknown');
+ assert.equal(wrong.json.hostCall, undefined);
+
+ const recovery = {...input, readThreadResult: read('final-reused'), readThreadEvidenceRef: 'fixture/read.json'};
+ const restored = run('observe', recovery);
+ assert.equal(restored.code, 0);
+ assert.equal(restored.json.needsReconciliation, false);
+ assert.equal(restored.json.task.phase, 'review');
+ assert.equal(restored.json.task.result.success, true);
+ assert.equal(restored.json.task.result.summary, original);
+ assert.equal(restored.json.task.result.evidenceRef, recovery.readThreadEvidenceRef);
+ assert.equal(restored.json.hostCall, undefined);
+ assert.deepEqual(run('observe', recovery), restored);
+ assert.deepEqual(run('observe', input), restored);
+ const recentWait = structuredClone(input);
+ recentWait.hostResult.polls[0].cursor = 'cursor:3';
+ recentWait.hostResult.polls[0].thread.hostId = 'local';
+ assert.deepEqual(run('observe', recentWait), restored);
+ assert.equal(run('archive', scope).json.error.code, 'ACCEPTANCE_REQUIRED');
+ assert.equal(run('verify', {
+  ...scope, resultEventId: restored.json.task.result.eventId, status: 'passed', evidenceRefs: ['fixture/verified.json']
+ }).code, 0);
+ assert.equal(run('accept', scope).code, 0);
+ assert.equal(run('archive', scope).json.hostCall.arguments.archived, true);
+});

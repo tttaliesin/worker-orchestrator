@@ -14,13 +14,39 @@ const completedResult = {
   verification: {status: 'passed', evidenceRefs: ['worker-evidence']}, pendingRequests: []
 };
 const finalMessage = result => ({
-  text: JSON.stringify(result), turnId: terminalPoll.latestTurn.id, phase: 'final_answer'
+  id: 'message-1', text: JSON.stringify(result), turnId: terminalPoll.latestTurn.id, phase: 'final_answer'
 });
 const activeThread = (...activeFlags) => ({
   ...terminalPoll.thread, status: {type: 'active', activeFlags}
 });
-const observePoll = (poll, evidenceRef = 'evidence') =>
-  observationFromWait({polls: [poll]}, workerRef, 'r', evidenceRef);
+const observePoll = (poll, evidenceRef = 'evidence', readBack) =>
+  observationFromWait({polls: [poll]}, workerRef, 'r', evidenceRef, readBack);
+const windowsResult = {...completedResult, summary: 'Wrote F:\\sample\\report.json'};
+const compactWindowsPoll = {
+  ...terminalPoll,
+  latestAssistantMessageId: 'message-1',
+  latestAssistantMessage: {
+    ...finalMessage(windowsResult), text: JSON.stringify(windowsResult).replaceAll('\\\\', '\\')
+  }
+};
+const alternateHostPoll = {
+  ...compactWindowsPoll,
+  thread: {...activeThread('waitingOnApproval'), hostId: 'remote-control:example'}
+};
+
+function readThreadPayload(result = windowsResult, status = 'completed') {
+  const {id, text, phase} = finalMessage(result);
+  return {
+    thread: terminalPoll.thread,
+    page: {limit: 1, hasMore: true},
+    turns: [{...terminalPoll.latestTurn, status, items: [
+      {type: 'agentMessage', id: 'commentary-1', phase: 'commentary', text: 'Checking the fixture'},
+      {type: 'agentMessage', id, text, phase}
+    ]}]
+  };
+}
+
+const readBackFrom = (hostResult = readThreadPayload()) => ({hostResult, evidenceRef: 'read-evidence'});
 
 test('creates a local project conversation with explicit execution settings',()=>{
  const call=hostCallFor(action); assert.equal(call.arguments.target.projectId,'desktop-p'); assert.equal(call.arguments.model,'test-model');assert.equal(call.arguments.thinking,'high');assert.match(call.arguments.prompt,/runId: r/);
@@ -165,6 +191,7 @@ test('ignores stale worker requests when the host reports attention', () => {
 test('malformed or nonfinal worker replies cannot become terminal results', () => {
   const request = {id: 'approval-1', kind: 'approval', summary: 'Approval required'};
   const valid = finalMessage(completedResult);
+  const broken = compactWindowsPoll.latestAssistantMessage;
   const malformed = [
     ['missing requests', finalMessage({...completedResult, pendingRequests: undefined})],
     ['requests as an object', finalMessage({...completedResult, pendingRequests: request})],
@@ -176,17 +203,174 @@ test('malformed or nonfinal worker replies cannot become terminal results', () =
     ['invalid verification', finalMessage({...completedResult, verification: {status: 'passed'}})],
     ['missing summary', finalMessage({...completedResult, summary: undefined})],
     ['unexpected result field', finalMessage({...completedResult, extra: true})],
+    ['stale run', finalMessage({...completedResult, runId: 'old-run'})],
     ['commentary', {...valid, phase: 'commentary'}],
     ['different turn', {...valid, turnId: 'previous-turn'}],
-    ['truncated JSON', {...valid, text: valid.text.slice(0, -1)}]
+    ['decode failure without a message ID', {...broken, id: undefined}],
+    ['decode failure without a turn ID', {...broken, turnId: undefined}],
+    ['commentary decode failure', {...broken, phase: 'commentary'}],
+    ['decode failure on a different turn', {...broken, turnId: 'previous-turn'}]
   ];
   for (const [label, latestAssistantMessage] of malformed) {
-    const observation = observationFromWait(
-      {polls: [{...terminalPoll, latestAssistantMessage}]}, workerRef, 'r', 'evidence'
-    );
+    const poll = {...terminalPoll, latestAssistantMessage};
+    const observation = observePoll(poll);
     assert.equal(observation.status, 'unknown', label);
     assert.equal(observation.result, undefined, label);
+    assert.equal(observation.readThread, undefined, label);
+    assert.deepEqual(observePoll(poll, 'evidence', readBackFrom()), observation, label);
   }
+});
+test('recovers Windows-path JSON from the exact original final message', () => {
+  assert.throws(() => JSON.parse(compactWindowsPoll.latestAssistantMessage.text), SyntaxError);
+  const compact = observePoll(compactWindowsPoll);
+  assert.equal(compact.status, 'unknown');
+  assert.equal(compact.result, undefined);
+  assert.equal(compact.evidenceRef, 'evidence');
+  assert.deepEqual(compact.readThread, {
+    ...workerRef, turnLimit: 1, includeOutputs: false, maxOutputCharsPerItem: 12000
+  });
+
+  const readBack = readBackFrom(envelope(readThreadPayload()));
+  const recovered = observePoll(compactWindowsPoll, 'evidence', readBack);
+  assert.equal(recovered.status, 'completed');
+  assert.deepEqual(recovered.result, {success: true, summary: finalMessage(windowsResult).text});
+  assert.equal(recovered.evidenceRef, readBack.evidenceRef);
+  assert.equal(recovered.readThread, undefined);
+  assert.equal(recovered.hostTurnId, compact.hostTurnId);
+  assert.equal(recovered.hostCursor, compact.hostCursor);
+  assert.notEqual(recovered.eventId, compact.eventId);
+  assert.deepEqual(observePoll(compactWindowsPoll, 'evidence', readBack), recovered);
+
+  const validPoll = {...compactWindowsPoll, latestAssistantMessage: finalMessage(completedResult)};
+  assert.deepEqual(observePoll(validPoll, 'evidence', readBack), observePoll(validPoll));
+});
+test('rejects uncorrelated, failed, truncated, or invalid originals without requesting a second read', () => {
+  const original = readThreadPayload();
+  const [turn] = original.turns;
+  const message = turn.items.at(-1);
+  const withTurn = fields => ({...original, turns: [{...turn, ...fields}]});
+  const withMessage = fields => withTurn({items: [{...message, ...fields}]});
+  const unusableReads = [
+    ['host error', {...envelope(original), isError: true}],
+    ['bad envelope', {content: [{type: 'text', text: '{"turns": ['}]}],
+    ['wrong thread', {...original, thread: {...original.thread, id: 'another-worker'}}],
+    ['wrong host', {...original, thread: {...original.thread, hostId: 'another-host'}}],
+    ['missing host', {...original, thread: {...original.thread, hostId: undefined}}],
+    ['wrong turn', withTurn({id: 'later-turn'})],
+    ['wrong status', withTurn({status: 'failed'})],
+    ['wrong message', withMessage({id: 'another-message'})],
+    ['wrong item type', withMessage({type: 'userMessage'})],
+    ['wrong phase', withMessage({phase: 'commentary'})],
+    ['ambiguous message', withTurn({items: [message, message]})],
+    ['truncated text', withMessage({text: message.text.slice(0, -1)})],
+    ['truncation marker', withMessage({truncated: true})],
+    ['stale run', readThreadPayload({...windowsResult, runId: 'old-run'})],
+    ['invalid worker-result schema', readThreadPayload({...windowsResult, pendingRequests: null})]
+  ];
+  const compact = observePoll(compactWindowsPoll);
+  for (const [label, hostResult] of unusableReads) {
+    const observation = observePoll(compactWindowsPoll, 'evidence', readBackFrom(hostResult));
+    assert.equal(observation.status, 'unknown', label);
+    assert.equal(observation.result, undefined, label);
+    assert.equal(observation.readThread, undefined, label);
+    assert.equal(observation.evidenceRef, 'evidence', label);
+    assert.equal(observation.eventId, compact.eventId, label);
+  }
+});
+test('retains host waits on a failed read and honors requests in a matching original', () => {
+  const poll = {...compactWindowsPoll, thread: activeThread({type: 'waitingOnApproval', id: 'approval-1'})};
+  const compact = observePoll(poll);
+  assert.equal(compact.status, 'waiting_approval');
+  assert.equal(compact.readThread.hostId, workerRef.hostId);
+  assert.deepEqual(compact.waits, [{waitId: 'approval-1', kind: 'approval'}]);
+
+  const failed = observePoll(poll, 'evidence', readBackFrom({isError: true}));
+  assert.equal(failed.status, 'waiting_approval');
+  assert.deepEqual(failed.waits, compact.waits);
+  assert.equal(failed.readThread, undefined);
+
+  const original = readThreadPayload({...windowsResult, pendingRequests: [
+    {id: 'question-1', kind: 'input', summary: 'Answer required'}
+  ]});
+  original.thread = activeThread({type: 'waitingOnUserInput', id: 'host-question'});
+  const recovered = observePoll(poll, 'evidence', readBackFrom(original));
+  assert.equal(recovered.status, 'waiting_input');
+  assert.deepEqual(recovered.waits, [
+    {waitId: 'question-1', kind: 'input'},
+    {waitId: 'approval-1', kind: 'approval'},
+    {waitId: 'host-question', kind: 'input'}
+  ]);
+  assert.equal(recovered.result, undefined);
+  assert.equal(recovered.evidenceRef, 'read-evidence');
+});
+test('only requests originals for terminal turns with consistent compact keys', () => {
+  const running = observePoll({...compactWindowsPoll, latestTurn: {...terminalPoll.latestTurn, status: 'inProgress'}});
+  assert.equal(running.status, 'running');
+  assert.equal(running.readThread, undefined);
+  const inconsistent = observePoll({...compactWindowsPoll, latestAssistantMessageId: 'another-message'});
+  assert.equal(inconsistent.status, 'unknown');
+  assert.equal(inconsistent.readThread, undefined);
+
+  for (const status of ['failed', 'interrupted']) {
+    const poll = {...compactWindowsPoll, latestTurn: {...terminalPoll.latestTurn, status}};
+    assert.equal(observePoll(poll).readThread.threadId, workerRef.threadId);
+    const recovered = observePoll(poll, 'evidence', readBackFrom(readThreadPayload(windowsResult, status)));
+    assert.equal(recovered.status, 'failed');
+    assert.equal(recovered.result.success, false);
+  }
+});
+test('an alternate host only supplies compact correlation keys for a read on the registered host', () => {
+  const compact = observePoll(alternateHostPoll);
+  assert.equal(compact.status, 'unknown');
+  assert.equal(compact.waits, undefined);
+  assert.equal(compact.hostCursor, undefined);
+  assert.deepEqual(compact.readThread, {
+    ...workerRef, turnLimit: 1, includeOutputs: false, maxOutputCharsPerItem: 12000
+  });
+
+  const original = readThreadPayload();
+  const wrongHost = {...original, thread: {...original.thread, hostId: alternateHostPoll.thread.hostId}};
+  const ignored = observePoll(alternateHostPoll, 'evidence', readBackFrom(wrongHost));
+  assert.equal(ignored.status, 'unknown');
+  assert.equal(ignored.waits, undefined);
+  assert.equal(ignored.readThread, undefined);
+
+  const readBack = readBackFrom(original);
+  const recovered = observePoll(alternateHostPoll, 'evidence', readBack);
+  assert.equal(recovered.status, 'completed');
+  assert.equal(recovered.evidenceRef, readBack.evidenceRef);
+  assert.notEqual(recovered.eventId, compact.eventId);
+  assert.deepEqual(observePoll(alternateHostPoll, 'evidence', readBack), recovered);
+});
+test('prefers a matching registered poll, accepts omitted hosts, and limits other-host polls to recovery', () => {
+  const validAlternate = {...alternateHostPoll, latestAssistantMessage: finalMessage(completedResult)};
+  assert.throws(() => observePoll(validAlternate), {code: 'HOST_CONTRACT'});
+  const observe = (...polls) => observationFromWait({polls}, workerRef, 'r', 'evidence');
+  assert.throws(() => observe(alternateHostPoll, {...alternateHostPoll}), {code: 'HOST_CONTRACT'});
+  assert.throws(() => observe({...alternateHostPoll, thread: {...alternateHostPoll.thread, id: 'another-worker'}}),
+    {code: 'HOST_CONTRACT'});
+
+  const strict = {...terminalPoll, latestAssistantMessage: finalMessage(completedResult)};
+  const undeclared = {...strict, thread: {id: workerRef.threadId, status: strict.thread.status}};
+  assert.deepEqual(observePoll(undeclared), observePoll(strict));
+  assert.deepEqual(observe({...undeclared, cursor: 'earlier'}, strict), observePoll(strict));
+  assert.deepEqual(observe(alternateHostPoll, strict), observePoll(strict));
+  assert.deepEqual(observe(alternateHostPoll, terminalPoll), observePoll(terminalPoll));
+});
+test('recovery event identity follows the message across cursor and host changes', () => {
+  const compact = observePoll(compactWindowsPoll);
+  const nextMessage = {...compactWindowsPoll,
+    latestAssistantMessageId: 'message-2', latestAssistantMessage: {...compactWindowsPoll.latestAssistantMessage, id: 'message-2'}};
+  const next = observePoll(nextMessage);
+  assert.equal(next.status, 'unknown');
+  assert.deepEqual(next.readThread, compact.readThread);
+  assert.notEqual(next.eventId, compact.eventId);
+
+  const laterAlias = {...alternateHostPoll, cursor: 'later-cursor'};
+  assert.equal(observePoll(laterAlias).eventId, compact.eventId);
+  const readBack = readBackFrom();
+  const recovered = observePoll(compactWindowsPoll, 'evidence', readBack);
+  assert.equal(observePoll(laterAlias, 'evidence', readBack).eventId, recovered.eventId);
 });
 test('observation identity includes the run and final evidence at the same cursor', () => {
   const observe = (poll, runId = 'r', evidenceRef = 'evidence') =>

@@ -37,6 +37,7 @@ export function main(argv = process.argv.slice(2)) {
     if (!path.isAbsolute(stateDir)) throw Object.assign(new Error('--state-dir must be absolute'),{code:'INPUT'});
     app = new Orchestrator(stateDir);
     let hostIssue;
+    let readThread;
     const recordingHostResult = opts.command === 'record' && Object.hasOwn(input, 'hostResult');
     if (recordingHostResult) {
       if (input.outcome === 'rejected') throw Object.assign(new Error(
@@ -54,12 +55,29 @@ export function main(argv = process.argv.slice(2)) {
       Object.assign(input, normalized);
       delete input.hostResult;
     }
-    if (opts.command === 'observe' && Object.hasOwn(input, 'hostResult')) {
-      const snapshot = app.execute('status', {projectId:input.projectId,taskId:input.taskId});
-      const workerRef = snapshot.task?.workerRef ?? snapshot.task?.worker;
-      if (!workerRef) throw Object.assign(new Error('No worker is bound to this task'),{code:'WORKER_MISMATCH'});
-      Object.assign(input, observationFromWait(input.hostResult, workerRef, input.runId, input.evidenceRef));
-      delete input.hostResult;
+    if (opts.command === 'observe') {
+      const hasWaitResult = Object.hasOwn(input, 'hostResult');
+      const hasReadResult = Object.hasOwn(input, 'readThreadResult');
+      let readBack;
+      if (hasReadResult || Object.hasOwn(input, 'readThreadEvidenceRef')) {
+        if (!hasReadResult || !hasWaitResult || typeof input.readThreadEvidenceRef !== 'string'
+          || !input.readThreadEvidenceRef.trim()) {
+          throw Object.assign(new Error('Read recovery requires hostResult, readThreadResult, and readThreadEvidenceRef'), {code:'INPUT'});
+        }
+        readBack = {hostResult: input.readThreadResult, evidenceRef: input.readThreadEvidenceRef};
+      }
+      if (hasWaitResult) {
+        const snapshot = app.execute('status', {projectId:input.projectId,taskId:input.taskId});
+        const workerRef = snapshot.task?.workerRef ?? snapshot.task?.worker;
+        if (!workerRef) throw Object.assign(new Error('No worker is bound to this task'),{code:'WORKER_MISMATCH'});
+        const {readThread: lookup, ...observation} = observationFromWait(
+          input.hostResult, workerRef, input.runId, input.evidenceRef, readBack);
+        readThread = lookup;
+        Object.assign(input, observation);
+        delete input.hostResult;
+        delete input.readThreadResult;
+        delete input.readThreadEvidenceRef;
+      }
     }
     let result;
     try { result = app.execute(opts.command, input); }
@@ -74,6 +92,9 @@ export function main(argv = process.argv.slice(2)) {
     const response = {ok:true,version:'0.1.0',...result};
     if (hostIssue) { response.ok=false; response.hostError=hostIssue; }
     if (result.action && !result.needsReconciliation) response.hostCall = hostCallFor(result.action, result.project);
+    if (readThread && (result.needsReconciliation || result.task.hostStatus?.startsWith('waiting_'))) {
+      response.hostCall = {tool:'mcp__codex_app__read_thread', arguments:readThread};
+    }
     console.log(JSON.stringify(response, null, 2));
     return hostIssue ? 1 : 0;
   } catch (error) {

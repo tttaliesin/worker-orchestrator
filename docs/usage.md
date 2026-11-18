@@ -109,6 +109,11 @@ $InputObject | ConvertTo-Json -Depth 40 -Compress |
 ```
 
 공식 wait 응답은 `status`와 `eventId` 대신 원문 `hostResult`로 전달할 수도 있습니다.
+최종 메시지의 JSON을 해석할 수 없고 턴과 메시지의 ID가 있으면 `observe`가 읽기 전용 `read_thread` 호출 계획을 반환합니다.
+컨트롤러는 `hostCall`의 인수로 원문을 바로 조회합니다.
+이어서 같은 `observe` 입력에 조회 응답 `readThreadResult`와 근거 참조 `readThreadEvidenceRef`를 더해 호출합니다.
+등록된 워커 호스트에서 동일한 턴과 최종 메시지 ID를 확인한 경우에 원문 결과를 기록합니다.
+조회가 실패하거나 식별자가 다르면 확인할 수 있는 대기 상태나 미확인 상태로 남습니다.
 원문 완료 판정은 워커 최종 JSON의 최상위 `runId`가 현재 실행과 일치해야 합니다.
 이전 실행의 완료 응답으로 새 실행을 완료 처리하지 않습니다.
 정규화한 입력을 직접 작성할 때 `eventId`는 같은 작업의 실행 전체에서 고유해야 합니다.
