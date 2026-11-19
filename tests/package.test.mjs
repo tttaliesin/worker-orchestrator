@@ -32,7 +32,7 @@ test('relocated package validates itself and opens usable SQLite state with only
   assert.equal(structural.capabilities, null);
   await assert.rejects(access(fixture.stateDir), { code: 'ENOENT' });
   const checked = await checkPackage({ root: fixture.root, stateDir: fixture.stateDir });
-  assert.equal(checked.version, '0.1.0');
+  assert.equal(checked.version, fixture.built.version);
   assert.deepEqual(checked.skills, ['worker-controller', 'worker-executor']);
   const selfCheck = fixture.run('scripts/check-package.mjs', ['--state-dir', fixture.stateDir]);
   assert.equal(selfCheck.status, 0, selfCheck.stderr);
@@ -67,7 +67,10 @@ test('checker detects changed bytes even when a filename and byte count are unch
   const root = await (await installation).clone('tampered');
   const filename = path.join(root, 'dist/cli.mjs');
   const source = await readFile(filename, 'utf8');
-  await writeFile(filename, source.replace('main();', 'maim();'));
+  const tampered = source.replace('main(', 'maim(');
+  assert.notEqual(tampered, source);
+  assert.equal(Buffer.byteLength(tampered), Buffer.byteLength(source));
+  await writeFile(filename, tampered);
   await assert.rejects(checkPackage({ root, smoke: false }), /Hash mismatch/);
 });
 

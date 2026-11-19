@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { lstat, mkdir, mkdtemp, open, readFile, readdir, rename, rm, rmdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { withBuildOutputLock } from '../../scripts/check-package.mjs';
+import { isSemVer, withBuildOutputLock } from '../../scripts/check-package.mjs';
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const portableSchema = 'https://agent-plugins.org/schemas/1.0.0/plugin.schema.json';
@@ -96,16 +96,44 @@ async function publishFiles(outputRoot, files, manifest) {
   }
 }
 
+function gitAt(root, args) {
+  return spawnSync('git', ['-C', root, ...args], { encoding: 'utf8', windowsHide: true });
+}
+
 function revisionFor(root) {
-  const git = spawnSync('git', ['-C', root, 'rev-parse', '--verify', 'HEAD'], { encoding: 'utf8', windowsHide: true });
-  const revision = git.stdout?.trim();
-  return git.status === 0 && /^[a-f0-9]{40,64}$/.test(revision) ? revision : null;
+  const git = gitAt(root, ['rev-parse', '--show-prefix', '--verify', 'HEAD']);
+  if (git.status !== 0) return null;
+  const [prefix, revision] = git.stdout.split(/\r?\n/);
+  return prefix === '' && /^[a-f0-9]{40,64}$/.test(revision) ? revision : null;
+}
+
+function isReleaseTag(tag) {
+  return typeof tag === 'string' && tag.startsWith('v') && isSemVer(tag.slice(1));
+}
+
+function selectReleaseTag(root, revision, tag) {
+  if (tag !== undefined) {
+    if (!isReleaseTag(tag)) throw new Error('--tag must be v followed by valid SemVer.');
+    const ref = gitAt(root, ['show-ref', '--verify', '--hash', `refs/tags/${tag}`]);
+    if (ref.status !== 0) throw new Error(`Release tag does not exist: ${tag}`);
+    const commit = gitAt(root, ['rev-parse', '--verify', `${ref.stdout.trim()}^{commit}`]);
+    if (!revision || commit.status !== 0 || commit.stdout.trim() !== revision) {
+      throw new Error(`Release tag ${tag} must point to the build HEAD.`);
+    }
+    return tag;
+  }
+  if (!revision) return undefined;
+  const git = gitAt(root, ['tag', '--list', '--points-at', revision]);
+  if (git.status !== 0) throw new Error(`Could not list tags at build HEAD: ${git.stderr?.trim() ?? ''}`);
+  const tags = git.stdout.split(/\r?\n/).filter(isReleaseTag);
+  if (tags.length > 1) throw new Error(`Multiple release tags point to build HEAD (${tags.join(', ')}). Select one with --tag.`);
+  return tags[0];
 }
 
 const json = value => `${JSON.stringify(value, null, 2)}\n`;
 
 /** Builds files only; never registers, installs, uploads, or invokes Desktop tools. */
-export async function buildPackage({ repoRoot = repositoryRoot, outputRoot = path.join(repoRoot, 'dist/codex') } = {}) {
+export async function buildPackage({ repoRoot = repositoryRoot, outputRoot = path.join(repoRoot, 'dist/codex'), tag } = {}) {
   assertNode();
   repoRoot = path.resolve(repoRoot);
   outputRoot = path.resolve(outputRoot);
@@ -120,9 +148,14 @@ export async function buildPackage({ repoRoot = repositoryRoot, outputRoot = pat
 
   const metadata = JSON.parse(await readRegular(path.join(repoRoot, 'package.json')));
   const portable = JSON.parse(await readRegular(path.join(repoRoot, 'builders/codex/plugin.json')));
-  if (portable.$schema !== portableSchema || portable.name !== metadata.name || portable.version !== metadata.version || portable.version !== '0.1.0') {
-    throw new Error('Portable plugin identity and version must match package.json (0.1.0).');
+  if (portable.$schema !== portableSchema || portable.name !== metadata.name) {
+    throw new Error('Portable plugin identity must match package.json.');
   }
+  const revision = revisionFor(repoRoot);
+  const releaseTag = selectReleaseTag(repoRoot, revision, tag);
+  const version = releaseTag ? releaseTag.slice(1) : metadata.version;
+  if (!isSemVer(version)) throw new Error('Build version must be valid SemVer.');
+  portable.version = version;
   const compatibility = {
     name: portable.name,
     version: portable.version,
@@ -136,7 +169,7 @@ export async function buildPackage({ repoRoot = repositoryRoot, outputRoot = pat
     ...await readTree(path.join(repoRoot, 'builders/codex/skills'), 'skills'),
     ['plugin.json', Buffer.from(json(portable))],
     ['.codex-plugin/plugin.json', Buffer.from(json(compatibility))],
-    ['dist/cli.mjs', Buffer.from("#!/usr/bin/env node\nimport { main } from '../lib/cli/main.mjs';\nprocess.exitCode = main();\n")],
+    ['dist/cli.mjs', Buffer.from(`#!/usr/bin/env node\nimport { main } from '../lib/cli/main.mjs';\nprocess.exitCode = main(undefined, ${JSON.stringify(version)});\n`)],
     ['README.md', await readRegular(path.join(repoRoot, 'builders/codex/README.package.md'))],
     ['scripts/check-package.mjs', await readRegular(path.join(repoRoot, 'scripts/check-package.mjs'))],
   ]);
@@ -155,7 +188,8 @@ export async function buildPackage({ repoRoot = repositoryRoot, outputRoot = pat
     formatVersion: 1,
     name: portable.name,
     version: portable.version,
-    revision: revisionFor(repoRoot),
+    revision,
+    ...(releaseTag ? { releaseTag } : {}),
     runtime: { name: 'node', range: metadata.engines.node, builtWith: process.versions.node },
     files: hashes,
   };
@@ -181,8 +215,11 @@ export async function buildPackage({ repoRoot = repositoryRoot, outputRoot = pat
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
   try {
-    if (process.argv.length > 2) throw new Error('Usage: node builders/codex/build.mjs');
-    console.log(json(await buildPackage()).trimEnd());
+    const args = process.argv.slice(2);
+    if (args.length && (args.length !== 2 || args[0] !== '--tag')) {
+      throw new Error('Usage: node builders/codex/build.mjs [--tag v<SemVer>]');
+    }
+    console.log(json(await buildPackage({ tag: args[1] })).trimEnd());
   } catch (error) {
     console.error(JSON.stringify({ ok: false, error: error.message }));
     process.exitCode = 1;

@@ -20,11 +20,14 @@ function options(argv) {
   return opts;
 }
 
-export function main(argv = process.argv.slice(2)) {
+export function main(argv = process.argv.slice(2), packagedVersion) {
   let app;
   try {
     const opts = options(argv);
-    if (opts.command === '--version' || opts.command === 'version') { console.log(JSON.stringify({name:'worker-orchestrator',version:'0.1.0',schemaVersion:SCHEMA_VERSION})); return 0; }
+    const version = packagedVersion ?? JSON.parse(
+      fs.readFileSync(new URL('../../package.json', import.meta.url), 'utf8')
+    ).version;
+    if (opts.command === '--version' || opts.command === 'version') { console.log(JSON.stringify({name:'worker-orchestrator',version,schemaVersion:SCHEMA_VERSION})); return 0; }
     if (opts.command === '--help' || !opts.command) { console.log(JSON.stringify({usage:'node dist/cli.mjs <command> --state-dir <absolute-directory> --input <json-file|->',commands:['project','dispatch','record','observe','resolve','verify','accept','archive','status','capabilities'],hostExecution:'The authorized controller performs returned hostCall, then records the real result.'})); return 0; }
     if (opts.command === 'capabilities') { console.log(JSON.stringify({ok:true,...capabilityDescription()})); return 0; }
     const supported = ['project','dispatch','record','observe','resolve','verify','accept','archive','status'];
@@ -89,7 +92,7 @@ export function main(argv = process.argv.slice(2)) {
       hostIssue = {code:error.code ?? 'HOST_CONTRACT',message:error.message};
       result = app.execute('record', {projectId:input.projectId,taskId:input.taskId,actionId:input.actionId,outcome:'unknown',receipt:{},evidenceRef:input.evidenceRef});
     }
-    const response = {ok:true,version:'0.1.0',...result};
+    const response = {ok:true,version,...result};
     if (hostIssue) { response.ok=false; response.hostError=hostIssue; }
     if (result.action && !result.needsReconciliation) response.hostCall = hostCallFor(result.action, result.project);
     if (readThread && (result.needsReconciliation || result.task.hostStatus?.startsWith('waiting_'))) {

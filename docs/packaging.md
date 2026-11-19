@@ -18,6 +18,29 @@ Git revision을 얻지 못하면 `revision`은 `null`입니다.
 해시는 변경 탐지용입니다.
 해시는 서명이나 게시자 인증을 대신하지 않습니다.
 
+## 릴리스 태그에서 빌드하기
+
+릴리스 ZIP을 만들 때는 배포할 Git 태그를 체크아웃한 뒤 빌드에 같은 태그를 지정하십시오.
+다음은 `v0.1.2` 태그를 빌드하고 검사하는 명령입니다.
+
+```text
+npm run build -- --tag v0.1.2
+npm run check
+```
+
+빌더는 현재 `HEAD`를 가리키는 유효한 `v` 접두사 SemVer 태그를 받습니다.
+빌더는 태그에서 `v`를 뺀 버전을 두 플러그인 매니페스트와 패키지 매니페스트에 기록합니다.
+설치본 CLI의 `--version`도 같은 값을 출력합니다.
+패키지 매니페스트의 `releaseTag`에는 태그를 기록하고, `revision`에는 해당 커밋을 기록합니다.
+
+`--tag`를 생략하면 빌더는 현재 커밋의 유효한 버전 태그가 하나일 때 그 태그를 사용합니다.
+유효한 버전 태그가 여러 개면 `--tag`로 하나를 지정하십시오.
+유효한 버전 태그가 없으면 `package.json`의 개발 버전을 사용합니다.
+
+릴리스 ZIP에는 `dist/codex/`의 `marketplace.json`, `.agents/plugins/marketplace.json`, `worker-orchestrator/`를 담으십시오.
+
+## 패키지 검사
+
 설치 루트에서 다음 명령으로 내부 파일·링크·import·manifest와 CLI를 검사합니다.
 
 ```text

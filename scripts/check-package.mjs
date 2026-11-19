@@ -11,6 +11,12 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const scriptParent = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const portableSchema = 'https://agent-plugins.org/schemas/1.0.0/plugin.schema.json';
 
+export function isSemVer(value) {
+  if (typeof value !== 'string') return false;
+  const match = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.exec(value);
+  return match?.[0] === value && !match[1]?.split('.').some(identifier => /^0[0-9]+$/.test(identifier));
+}
+
 async function hasOutputLock(filename) {
   try {
     const stat = await lstat(filename);
@@ -207,7 +213,10 @@ async function checkInstalledPackage(root, marketplaceRoot, smoke, stateDir) {
   const manifest = await readJSON(path.join(root, 'package-manifest.json'));
   assert.equal(manifest.formatVersion, 1);
   assert.equal(manifest.name, 'worker-orchestrator');
-  assert.equal(manifest.version, '0.1.0');
+  assert.ok(isSemVer(manifest.version), 'Manifest version must be valid SemVer.');
+  if (Object.hasOwn(manifest, 'releaseTag')) {
+    assert.equal(manifest.releaseTag, `v${manifest.version}`, 'Manifest release tag must match the version.');
+  }
   assert.ok(manifest.revision === null || /^[a-f\d]{40,64}$/.test(manifest.revision), 'Revision must be a Git object ID or null for no available revision.');
   assert.equal(manifest.runtime?.name, 'node');
   assert.equal(manifest.runtime?.range, '>=24.0.0');
@@ -275,6 +284,9 @@ async function checkInstalledPackage(root, marketplaceRoot, smoke, stateDir) {
   let capabilities = null;
   if (smoke) {
     stateDir = path.resolve(stateDir ?? await mkdtemp(path.join(os.tmpdir(), 'worker-orchestrator-check-')));
+    const version = runInstalled(root, '--version', stateDir);
+    assert.equal(version.status, 0, `Installed CLI --version failed: ${version.stderr}\n${version.stdout}`);
+    assert.equal(JSON.parse(version.stdout).version, manifest.version, 'Installed CLI version must match the manifest.');
     const result = runInstalled(root, 'capabilities', stateDir);
     assert.equal(result.status, 0, `Installed CLI capabilities failed: ${result.stderr}\n${result.stdout}`);
     capabilities = JSON.parse(result.stdout);
