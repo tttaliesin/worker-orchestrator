@@ -429,3 +429,81 @@ Codex Desktop 호스트에서 `--state-dir`을 생략해 기존 `%LOCALAPPDATA%/
 실제 보관 응답을 `record`로 기록한 뒤 두 워커가 보관됐음을 확인했습니다.
 
 실제 호출에서 증상이 나타나지 않으면 두 CLI 회귀 테스트로 각 입력의 복구 동작을 확인할 수 있습니다. [회귀 테스트](../tests/cli/lifecycle.test.mjs)
+
+## 2026-11-19 로컬 개발 빌드 `0.1.5-local.3` 검증
+
+Codex Desktop에서 로컬 개발 빌드 `0.1.5-local.3`을 활성화하고 기존 기본 DB를 사용했습니다.
+같은 Desktop 프로젝트에서 새 워커를 생성하고, 첫 실행에서 빠진 검증 근거를 같은 워커의 두 번째 실행에서 확인한 뒤 대화를 보관했습니다.
+
+### 설치와 기본 DB
+
+- `codex plugin list --marketplace worker-orchestrator-local --json`에서 설치 버전과 활성 상태를 확인했습니다.
+  빌드와 설치 캐시의 SHA-256은 패키지 파일 21개와 패키지 매니페스트 1개에서 모두 일치했습니다.
+  설치본 CLI의 `--version`은 `0.1.5-local.3`과 `schemaVersion: 3`을 반환했습니다.
+- `codex app-server --listen stdio://`에서 `skills/list`를 호출해 두 스킬이 새 캐시에서 활성화된 것을 확인했습니다.
+  실제 워커 대화에서 새 `worker-executor` 스킬을 읽고 해당 형식으로 결과를 반환한 것을 확인했습니다.
+- 상태 명령에서 `--state-dir`을 생략해 기존 기본 DB를 사용했습니다.
+  실측 전후에 SQLite 백업본을 채취했습니다.
+  두 백업본에서 `PRAGMA integrity_check`는 `ok`였고 `PRAGMA foreign_key_check`는 빈 결과를 반환했습니다.
+  행을 대조해 기존 워커 4개, 실행 29개, 이력 242건이 보존됐음을 확인했습니다.
+- 저장된 Desktop 대상이 저장소 루트의 상위 그룹을 가리켰습니다.
+  `sync-project`로 실제 컨트롤러가 속한 그룹에 대상을 맞췄습니다.
+  기존 프로젝트 기록과 프로젝트 범위 위임은 보존됐습니다.
+  생성 후 Desktop 활성 목록에서 컨트롤러와 새 워커의 Desktop 프로젝트 ID와 작업 폴더가 각각 일치했습니다.
+
+### 재배정, 검증, 보관 결과
+
+| 단계 | 확인한 결과 |
+| --- | --- |
+| 최초 실행 | Desktop 생성 요청의 `thinking`은 `medium`이었습니다. 워커는 폴더명을 확인했고, 재현 조건에 따라 Git 최상위 경로의 검증 근거를 생략했습니다. 컨트롤러는 `repo-name`을 `met`, `git-root`를 `uncertain`으로 판정했습니다. |
+| 재배정 | `evaluate`는 `retry`와 `CRITERIA_NOT_MET`를 반환했습니다. Desktop 후속 요청의 `thinking`은 `high`였습니다. 생성과 후속 전달 응답의 `threadId`가 일치했고, 후속 실행에는 새 `runId`가 부여됐습니다. |
+| 독립 검증과 완료 | 컨트롤러는 워커 원문의 명령 출력을 별도로 실행한 폴더명과 Git 조회 결과에 대조했습니다. 양쪽에서 폴더명은 `worker-orchestrator`였고 Git 최상위 경로는 동일했으며 Git 종료 코드는 0이었습니다. 두 기준을 `met`으로 제출한 뒤 `decision.type: complete`, `task.phase: complete`와 검증 통과를 확인했습니다. |
+| 실제 보관 | 완료 평가 직후의 `task.archived`는 `false`였습니다. 보관 도구는 동일한 대화에 `archived: true`를 반환했습니다. `record` 이후의 `task.archived: true`를 Desktop 보관 목록의 실제 항목과 대조했습니다. |
+
+원본 도구 응답과 SQLite 백업은 Git에서 제외된 로컬 증거 디렉터리에 보관했습니다.
+
+### 근거 부족 재현
+
+1. 설치 목록에서 `0.1.5-local.3`이 활성 상태인지 확인하십시오.
+2. `node <설치 루트>/dist/cli.mjs --version`으로 설치본 CLI 버전과 스키마 3을 확인하십시오.
+3. 기존 기본 DB를 SQLite 백업 기능으로 백업하십시오.
+4. 기존 등록 컨트롤러에서 설치본 CLI의 `candidate --input -`에 `projectRoot`와 `includeStatus: true`를 보내십시오.
+   이 절의 상태 명령에는 `--state-dir`을 생략하십시오.
+   응답에서 컨트롤러 역할과 프로젝트 위임을 확인하십시오.
+5. 등록 대상이 실제 컨트롤러의 Desktop 그룹과 다르면 `list_projects`와 `list_threads`의 응답을 기존 CLI `projectId`와 함께 `sync-project`에 전달하십시오. [프로젝트 대상 확인](usage.md)
+6. 새 작업을 `dispatch`로 배정하십시오.
+   `workSpec`에는 현재 저장소의 읽기 전용 조회 제약과 아래 두 기준을 넣으십시오.
+   Desktop에서 지원하는 동일 모델에 대해 `profile.thinking`에 `medium`을 넣고 `workSpec.reasoningEscalations`에 `["high"]`를 넣으십시오.
+   실제 워커에게 현재 `runId`와 설치본 `worker-executor` 스킬을 전달하십시오.
+
+   | 기준 ID | 확인할 명령과 결과 |
+   | --- | --- |
+   | `repo-name` | PowerShell의 `(Get-Item -LiteralPath '.').Name`으로 현재 작업 폴더의 이름을 확인합니다. |
+   | `git-root` | `git rev-parse --show-toplevel`로 Git 최상위 경로를 확인합니다. 명령 직후 `$LASTEXITCODE`로 종료 코드를 확인합니다. |
+
+   최초 실행에 한해 워커가 `repo-name`만 확인하고 `git-root` 명령과 근거를 생략하도록 지시하십시오.
+   새로운 `runId`를 받으면 두 기준을 실제로 확인하도록 같은 지시에 명시하십시오.
+
+7. 반환된 `hostCall`로 워커를 생성하십시오.
+8. `record`에 `action.id`를 `actionId`로 전달하고 실제 생성 응답을 `hostResult`로 기록하십시오.
+9. `wait_threads`로 첫 실행을 관찰하십시오.
+   실제 대기 응답과 근거 참조를 현재 `runId`로 `observe`에 전달하십시오.
+   워커의 명령을 확인하려면 `read_thread`로 원문을 조회하십시오.
+10. 현재 결과의 `task.result.eventId`를 `resultEventId`로 지정해 `evaluate`를 호출하십시오.
+    `checks`에 `repo-name: met`과 `git-root: uncertain`을 각 판단 사유 및 실제 근거 참조와 함께 넣으십시오.
+    `constraintReview`에 읽기 전용 제약의 준수 여부와 근거를 넣으십시오.
+    근거 부족으로 재시도하는 경우 `decision.type: retry`를 확인하십시오.
+11. 재시도 응답의 `hostCall`로 같은 `threadId`에 후속 요청을 전달하십시오.
+    이 요청의 새 `runId`와 `thinking: high`를 확인하십시오.
+12. 후속 전달 응답을 재시도 `action.id`로 `record`에 기록하십시오.
+13. 새 `runId`로 워커를 관찰하십시오.
+    첫 실행과 같은 방식으로 `observe`에 기록하십시오.
+14. 컨트롤러에서 두 조회 명령을 별도로 실행하십시오.
+    이번 워커 원문의 폴더명, Git 최상위 경로, Git 종료 코드를 독립 실행 결과와 대조하십시오.
+15. 이번 실행의 `task.result.eventId`로 `evaluate`를 호출하십시오.
+    두 기준의 `met` 판정과 이번 실행의 근거를 제출하십시오.
+    검증이 끝났고 후속 작업이 없으며 보관 위임이 있으면 `keepWorker: false`를 넣으십시오.
+    `decision.type: complete`와 보관 `hostCall`을 확인하십시오.
+16. 반환된 `hostCall`로 같은 워커를 보관하십시오.
+17. 보관 응답을 보관 `action.id`로 `record`에 기록하십시오.
+18. 기록된 `task.archived: true`를 `list_archived_threads`의 실제 대화 항목과 대조하십시오.

@@ -6,9 +6,9 @@ import { pathToFileURL } from 'node:url';
 import { Orchestrator } from '../core/orchestrator.mjs';
 import { SCHEMA_VERSION } from '../state/sqlite-store.mjs';
 import { capabilityDescription, hostCallFor, receiptFromHost, observationFromWait, validateProfile } from '../adapters/codex-desktop/index.mjs';
-import { assessControllerCandidate, resolveControllerScope } from '../adapters/codex-desktop/controller-candidate.mjs';
+import { assessControllerCandidate, resolveControllerScope, validateProjectBinding } from '../adapters/codex-desktop/controller-candidate.mjs';
 
-const commands = ['candidate', 'project', 'dispatch', 'record', 'observe', 'resolve', 'verify', 'accept', 'archive', 'status'];
+const commands = ['candidate', 'project', 'sync-project', 'dispatch', 'record', 'observe', 'resolve', 'verify', 'evaluate', 'accept', 'archive', 'status'];
 
 function options(argv) {
   const [command, ...args] = argv;
@@ -35,24 +35,27 @@ export function main(argv = process.argv.slice(2), packagedVersion) {
     if (opts.command === 'capabilities') { console.log(JSON.stringify({ok:true,...capabilityDescription()})); return 0; }
     if (!commands.includes(opts.command)) throw Object.assign(new Error(`Unknown command: ${opts.command}`),{code:'INPUT'});
     if (!opts['--input']) throw Object.assign(new Error('--input is required'),{code:'INPUT'});
-    const input = JSON.parse(fs.readFileSync(opts['--input'] === '-' ? 0 : opts['--input'], 'utf8').replace(/^\uFEFF/, ''));
+    let input = JSON.parse(fs.readFileSync(opts['--input'] === '-' ? 0 : opts['--input'], 'utf8').replace(/^\uFEFF/, ''));
     if (!input || typeof input !== 'object' || Array.isArray(input)) throw Object.assign(new Error('Input must be a JSON object'),{code:'INPUT'});
     if (opts.command === 'dispatch') validateProfile(input.profile);
     const threadId = process.env.CODEX_THREAD_ID?.trim();
     const hostId = process.env.CODEX_HOST_ID?.trim() || null;
-    const caller = threadId ? { threadId, hostId } : null;
+    let caller = threadId ? { threadId, hostId } : null;
     const stateDir = opts['--state-dir'] ?? path.join(process.env.LOCALAPPDATA ?? path.join(os.homedir(), '.local', 'share'), 'WorkerOrchestrator', 'state');
     if (!path.isAbsolute(stateDir)) throw Object.assign(new Error('--state-dir must be absolute'),{code:'INPUT'});
     if (opts.command === 'candidate') {
       if (Object.hasOwn(input, 'claim') && typeof input.claim !== 'boolean') {
         throw Object.assign(new Error('claim must be a boolean.'), {code:'INPUT'});
       }
+      if (Object.hasOwn(input, 'includeStatus') && typeof input.includeStatus !== 'boolean') {
+        throw Object.assign(new Error('includeStatus must be a boolean.'), {code:'INPUT'});
+      }
       const scope = threadId ? resolveControllerScope(input.projectRoot ?? process.cwd()) : null;
       let result = { decision: 'undetermined', reason: threadId ? 'SCOPE_UNAVAILABLE' : 'MISSING_CURRENT_THREAD',
         claimed: false, project: null };
       if (scope) {
         app = new Orchestrator(stateDir);
-        const request = { ...scope, caller, claim: input.claim ?? false };
+        const request = { ...scope, caller, claim: input.claim ?? false, includeStatus: input.includeStatus ?? false };
         result = app.execute('candidate', request);
         if (result.reason === 'DISCOVERY_REQUIRED' && (Object.hasOwn(input, 'threadPages') || Object.hasOwn(input, 'projects'))) {
           const assessment = assessControllerCandidate(scope, threadId, hostId, input.projects, input.threadPages);
@@ -63,6 +66,12 @@ export function main(argv = process.argv.slice(2), packagedVersion) {
       return 0;
     }
     app = new Orchestrator(stateDir);
+    if (opts.command === 'sync-project') {
+      const { project } = app.execute('status', { projectId: input.projectId });
+      input = validateProjectBinding(project, caller, input.projects, input.threadPages);
+      // Desktop shells may only export CODEX_THREAD_ID.
+      caller = { ...caller, hostId: input.hostId };
+    }
     let hostIssue;
     let readThread;
     const recordingHostResult = opts.command === 'record' && Object.hasOwn(input, 'hostResult');

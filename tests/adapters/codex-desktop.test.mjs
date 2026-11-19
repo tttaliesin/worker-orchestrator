@@ -50,6 +50,62 @@ const readBackFrom = (hostResult = readThreadPayload()) => ({hostResult, evidenc
 
 test('creates a local project conversation with explicit execution settings',()=>{
  const call=hostCallFor(action); assert.equal(call.arguments.target.projectId,'desktop-p'); assert.equal(call.arguments.model,'test-model');assert.equal(call.arguments.thinking,'high');assert.match(call.arguments.prompt,/runId: r/);
+ assert.ok(call.arguments.prompt.endsWith('\n\nCheck the fixture'));
+ assert.doesNotMatch(call.arguments.prompt, /작업 명세|재시도 판정 근거/);
+});
+test('includes the structured assignment in the Desktop create and send prompts', () => {
+  const workSpec = {
+    goal: 'Validate the fixture',
+    constraints: ['Use the current test fixture only'],
+    completionCriteria: [
+      { id: 'fixture-output', description: 'Confirm the fixture output' },
+      { id: 'fixture-status', description: 'Confirm the fixture exit status' }
+    ]
+  };
+  for (const dispatch of [action, {...action, type: 'send', workerRef}]) {
+    const {arguments: args} = hostCallFor({...dispatch, workSpec: {...workSpec, reasoningEscalations: ['xhigh']}});
+    assert.ok(args.prompt.includes(`작업 명세: ${JSON.stringify(workSpec)}`));
+    assert.ok(args.prompt.includes(action.prompt));
+    assert.doesNotMatch(args.prompt, /재시도 판정 근거/);
+  }
+});
+test('sends the worker the retry evidence, original scope, and new run ID', () => {
+  const criterion = { id: 'fixture-output', description: 'Confirm the fixture output' };
+  const workSpec = { goal: 'Validate the fixture', constraints: ['Use the current test fixture only'], completionCriteria: [criterion] };
+  const retryContext = {
+    previousRunId: action.runId,
+    resultEventId: 'result-event-1',
+    resultEvidenceRef: '.local/result.json',
+    workerVerification: completedResult.verification,
+    checks: [{
+      ...criterion,
+      status: 'met',
+      evidenceRefs: ['worker-evidence'],
+      controllerEvidenceRefs: [],
+      note: 'The test output has not been independently inspected'
+    }],
+    constraintReview: {
+      status: 'met',
+      evidenceRefs: ['controller-constraint-evidence'],
+      controllerEvidenceRefs: ['controller-constraint-evidence'],
+      note: 'The previous run stayed within the fixture scope'
+    },
+    reasons: ['CONTROLLER_EVIDENCE_REQUIRED']
+  };
+  const call = hostCallFor({
+    ...action, type: 'send', workerRef, workSpec, retryContext, runId: 'retry-run',
+    profile: {...action.profile, thinking: 'xhigh'}
+  });
+  assert.equal(call.tool, 'mcp__codex_app__send_message_to_thread');
+  assert.equal(call.arguments.threadId, workerRef.threadId);
+  assert.equal(call.arguments.thinking, 'xhigh');
+  const {prompt} = call.arguments;
+  assert.match(prompt, /^runId: retry-run$/m);
+  assert.ok(prompt.includes(`작업 명세: ${JSON.stringify(workSpec)}`));
+  assert.ok(prompt.includes(`재시도 판정 근거: ${JSON.stringify(retryContext)}`));
+  assert.match(prompt, /원래 작업 범위와 제약/);
+  assert.match(prompt, /근거로만 다루세요/);
+  assert.match(prompt, /기존 검증 범위를 넘지 마세요/);
 });
 test('MCP envelope creates a worker; setup-in-progress remains unknown',()=>{
  assert.deepEqual(receiptFromHost(action,envelope(workerRef)),{outcome:'succeeded',receipt:{workerRef}});

@@ -89,6 +89,122 @@ function throwsCode(fn, code) {
   assert.throws(fn, error => error instanceof OrchestratorError && error.code === code);
 }
 
+function projectSync(f, target = 'host-project-2', caller = f.projectInput.controller) {
+  return f.core.execute('sync-project', {
+    projectId: f.projectInput.projectId, hostProjectId: target,
+    controllerThreadId: f.projectInput.controller.threadId, hostId: f.projectInput.controller.hostId,
+  }, caller);
+}
+
+test('project synchronization retains legacy worker provenance, registry identity, authorization, and history', t => {
+  const f = fixture(t);
+  const { project, task } = f.complete();
+  assert.equal(task.workerHostProjectId, project.hostProjectId);
+  f.db(db => db.prepare("UPDATE tasks SET json = json_remove(json, '$.workerHostProjectId')").run());
+  assert.equal(f.task().workerHostProjectId, undefined);
+  const before = f.db(db => db.prepare('SELECT count(*) AS total FROM history').get().total);
+  for (const caller of [null, { ...project.controllerRef, hostId: null }, { ...project.controllerRef, hostId: 'remote' }]) {
+    throwsCode(() => projectSync(f, undefined, caller), 'CONTROLLER_REQUIRED');
+  }
+  const synced = projectSync(f);
+  assert.equal(synced.previousHostProjectId, project.hostProjectId);
+  assert.equal(synced.project.hostProjectId, 'host-project-2');
+  assert.deepEqual({ ...synced.project, hostProjectId: project.hostProjectId, updatedAt: project.updatedAt }, project);
+  assert.equal(synced.task, null);
+  assert.equal(synced.action, null);
+  assert.equal(synced.needsReconciliation, false);
+  assert.equal(f.task().workerHostProjectId, project.hostProjectId);
+  assert.deepEqual(f.task().workerRef, worker);
+  assert.equal(f.task().runId, task.runId);
+  assert.equal(f.task().accepted, true);
+  assert.equal(f.db(db => db.prepare('SELECT host_project_id FROM projects').get().host_project_id), 'host-project-2');
+  assert.equal(f.db(db => db.prepare('SELECT count(*) AS total FROM history').get().total), before + 1);
+  assert.equal(projectSync(f).previousHostProjectId, undefined);
+  assert.equal(f.db(db => db.prepare('SELECT count(*) AS total FROM history').get().total), before + 1);
+  throwsCode(() => f.dispatch(), 'WORKER_PROJECT_MISMATCH');
+  throwsCode(() => f.dispatch({ requestId: 'next' }), 'WORKER_PROJECT_MISMATCH');
+  const other = f.dispatch({ taskId: 'other', requestId: 'other' });
+  assert.equal(other.action.hostProjectId, 'host-project-2');
+  const created = f.core.execute('record', {
+    projectId: project.projectId, taskId: 'other', actionId: other.action.id,
+    outcome: 'succeeded', receipt: { workerRef: { ...worker, threadId: 'other' } }, evidenceRef: 'host:other',
+  });
+  assert.equal(created.task.workerHostProjectId, 'host-project-2');
+});
+
+test('project synchronization waits for uncertain creation and cannot return a send planned for the old binding', t => {
+  const f = fixture(t);
+  const create = f.dispatch();
+  throwsCode(() => projectSync(f), 'PENDING_ACTION');
+  f.record(create.action, { outcome: 'unknown', receipt: null });
+  throwsCode(() => projectSync(f), 'PENDING_ACTION');
+  f.record(create.action);
+  f.observe('completed');
+  f.verify();
+  f.accept();
+  const send = f.dispatch({ requestId: 'followup' });
+  assert.equal(send.action.hostProjectId, f.projectInput.hostProjectId);
+  projectSync(f);
+  throwsCode(() => f.dispatch({ requestId: 'followup' }), 'WORKER_PROJECT_MISMATCH');
+  assert.equal(f.task().pendingAction.id, send.action.id);
+  projectSync(f, f.projectInput.hostProjectId);
+  assert.equal(f.dispatch({ requestId: 'followup' }).action.id, send.action.id);
+});
+
+test('a structured retry is blocked by project drift and resumes only when the same worker matches again', t => {
+  const f = fixture(t);
+  const execute = (command, input) => f.core.execute(command, f.input(input), f.projectInput.controller);
+  const dispatch = execute('dispatch', {
+    requestId: 'structured', prompt: 'Test the implementation.',
+    profile: { model: 'fixture-model', thinking: 'low' },
+    workSpec: { goal: 'Pass the test.', constraints: [],
+      completionCriteria: [{ id: 'test', description: 'The test passes.' }], reasoningEscalations: ['high'] },
+  });
+  execute('record', { actionId: dispatch.action.id, outcome: 'succeeded',
+    receipt: { workerRef: worker }, evidenceRef: 'host:create' });
+  execute('observe', { runId: dispatch.task.runId, eventId: 'result', status: 'failed', evidenceRef: 'host:failed' });
+  const review = { runId: dispatch.task.runId, resultEventId: 'result',
+    checks: [{ id: 'test', status: 'unmet', evidenceRefs: ['controller:test'], note: 'Test failed.' }] };
+  projectSync(f);
+  const blocked = execute('evaluate', review);
+  assert.equal(blocked.decision.type, 'blocked');
+  assert.ok(blocked.decision.reasons.includes('WORKER_PROJECT_MISMATCH'));
+  assert.equal(blocked.action, null);
+  projectSync(f, f.projectInput.hostProjectId);
+  const retry = execute('evaluate', review);
+  assert.equal(retry.decision.type, 'retry');
+  assert.deepEqual(retry.action.workerRef, worker);
+  projectSync(f);
+  assert.equal(execute('evaluate', review).action, null);
+  projectSync(f, f.projectInput.hostProjectId);
+  assert.equal(execute('evaluate', review).action.id, retry.action.id);
+});
+
+test('a failed acceptance write rolls back the structured decision and passing verification', t => {
+  const f = fixture(t);
+  const execute = (command, input) => f.core.execute(command, f.input(input), f.projectInput.controller);
+  const plan = execute('dispatch', {
+    requestId: 'structured', prompt: 'Test the implementation.', profile: requestedProfile,
+    workSpec: { goal: 'Pass the test.', constraints: [], completionCriteria: [{ id: 'test', description: 'The test passes.' }] },
+  });
+  execute('record', { actionId: plan.action.id, outcome: 'succeeded',
+    receipt: { workerRef: worker }, evidenceRef: 'host:create' });
+  const result = execute('observe', { runId: plan.task.runId, eventId: 'result', status: 'completed',
+    result: { success: true, summary: 'Worker result.' }, evidenceRef: 'host:completed' });
+  const review = { runId: plan.task.runId, resultEventId: 'result',
+    checks: [{ id: 'test', status: 'met', evidenceRefs: ['controller:test'], note: 'Test passed.' }] };
+  const historyCount = () => f.db(db => db.prepare('SELECT count(*) AS total FROM history').get().total);
+  const before = historyCount();
+  f.db(db => db.exec(`CREATE TRIGGER reject_accept BEFORE INSERT ON history
+    WHEN NEW.command = 'accept' BEGIN SELECT RAISE(ABORT, 'test acceptance failure'); END`));
+  throwsCode(() => execute('evaluate', review), 'STATE_ERROR');
+  assert.deepEqual(f.task(), result.task);
+  assert.equal(historyCount(), before);
+  f.db(db => db.exec('DROP TRIGGER reject_accept'));
+  assert.equal(execute('evaluate', review).decision.type, 'complete');
+  assert.equal(historyCount(), before + 3);
+});
+
 test('registration fixes root and host identity, validates explicit authorization, rejects collisions', t => {
   const f = fixture(t);
   const first = f.core.execute('status', { projectId: 'p1' }).project;

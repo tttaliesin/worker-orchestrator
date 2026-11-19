@@ -174,6 +174,45 @@ test('project authorization persists and guards project mutations against a forg
   assert.deepEqual(run('status', task, { caller: outsider }).task, accepted.task);
 });
 
+test('dispatch rechecks authorization and worker state after a candidate status snapshot', async t => {
+  const { run, project, request } = await fixture(t);
+  const git = spawnSync('git', ['init', '--quiet', '--template='], {
+    cwd: project.projectRoot, encoding: 'utf8', windowsHide: true,
+    env: Object.fromEntries(Object.entries(baseEnv).filter(([key]) => !/^GIT_/i.test(key))),
+  });
+  assert.ifError(git.error);
+  assert.equal(git.status, 0, git.stderr);
+  const grant = projectGrant(project);
+  run('project', grant);
+  const { action: create } = run('dispatch', request);
+  run('record', receipt(create, worker));
+  const first = runScope(create);
+  const completed = run('observe', completion(first));
+  run('verify', passedVerification(completed.task));
+  const accepted = run('accept', first);
+  assertAcceptedAndOpen(accepted);
+
+  const snapshot = run('candidate', { projectRoot: project.projectRoot, includeStatus: true });
+  assert.equal(snapshot.reason, 'REGISTERED_CONTROLLER');
+  assert.equal(snapshot.project.authorization.sendFollowups, true);
+  assert.deepEqual(snapshot.tasks, [accepted.task]);
+
+  const followup = { ...request, requestId: 'fixture-request-2', reuseOnly: true };
+  run('project', { ...grant, authorization: { ...grant.authorization, sendFollowups: false } });
+  run('dispatch', followup, { errorCode: 'AUTHORIZATION_REQUIRED' });
+  assert.deepEqual(run('status', task).task, accepted.task);
+
+  run('project', grant);
+  const { action: send } = run('dispatch', followup);
+  assert.equal(send.type, 'send');
+  assert.deepEqual(send.workerRef, worker);
+  const { task: running } = run('record', receipt(send, { threadId: worker.threadId }));
+  assert.equal(running.phase, 'running');
+  assert.equal(running.pendingAction, null);
+  run('dispatch', { ...followup, requestId: 'fixture-request-3' }, { errorCode: 'TASK_BUSY' });
+  assert.deepEqual(run('status', task).task, running);
+});
+
 test('packaged CLI reuses a retained worker and restores it after verified, replayable archive-on-accept', async t => {
   const { run, project, request } = await fixture(t, { packaged: true });
   const grant = projectGrant(project);

@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { realpathSync, statSync } from 'node:fs';
 import { isAbsolute, relative, sep } from 'node:path';
-import { unwrapHostResult } from './index.mjs';
+import { HostContractError, unwrapHostResult } from './index.mjs';
 
 const text = value => typeof value === 'string' && value.trim().length > 0;
 const within = (root, directory) => {
@@ -43,7 +43,7 @@ export function resolveControllerScope(start) {
   return projectRoot && roots.includes(current) ? { projectRoot, roots, isGit: true } : null;
 }
 
-function readHistory(pages) {
+function readHistory(pages, { requireComplete = true } = {}) {
   if (!Array.isArray(pages) || !pages.length) return null;
   const seenCursors = new Set();
   const threads = [];
@@ -51,18 +51,19 @@ function readHistory(pages) {
   for (const [index, page] of pages.entries()) {
     if (!page || (page.cursor ?? null) !== cursor || seenCursors.has(cursor)) return null;
     seenCursors.add(cursor);
-    const result = unwrapHostResult(page.result);
+    let result;
+    try { result = unwrapHostResult(page.result); } catch { return null; }
     if (!Array.isArray(result.threads) || !(result.nextCursor === null || text(result.nextCursor))) return null;
     if (!result.threads.every(thread => thread?.kind === 'codex' && text(thread.id) && text(thread.hostId))) return null;
-    threads.push(...result.threads.filter(thread => thread.archived !== true));
+    threads.push(...result.threads);
     cursor = result.nextCursor;
     if (cursor === null && index !== pages.length - 1) return null;
+    if (cursor !== null && seenCursors.has(cursor)) return null;
   }
-  return cursor === null ? threads : null;
+  return cursor === null || !requireComplete ? threads : null;
 }
 
-function repositoryMembership(cwd, scope) {
-  const real = directory(cwd);
+function repositoryMembership(real, scope) {
   if (!real) return null;
   if (!scope.roots.some(root => within(root, real))) return false;
   if (scope.roots.includes(real) || !scope.isGit) return true;
@@ -71,56 +72,103 @@ function repositoryMembership(cwd, scope) {
   return actual ? scope.roots.includes(actual) : null;
 }
 
+function readProjects(raw, hostId) {
+  let catalog;
+  try { catalog = unwrapHostResult(raw).projects; } catch { return null; }
+  if (!Array.isArray(catalog)) return null;
+  const byId = new Map();
+  for (const project of catalog) {
+    if (!text(project?.projectId)) continue;
+    const entries = byId.get(project.projectId) ?? [];
+    entries.push(project);
+    byId.set(project.projectId, entries);
+  }
+  const projects = new Map();
+  for (const [id, entries] of byId) {
+    const sameHost = entries.filter(project => project.hostId === hostId &&
+      (project.projectKind === 'local' || (project.projectKind === 'remote' && hostId !== 'local')));
+    if (!sameHost.length) continue;
+    const path = directory(sameHost[0].path);
+    if (sameHost.length !== entries.length || sameHost.slice(1).some(project => directory(project.path) !== path)) {
+      return null;
+    }
+    if (path) projects.set(id, { id, path });
+  }
+  return projects;
+}
+
+function projectFits(path, cwd, scope) {
+  // Desktop can group a linked worktree under the primary checkout.
+  if (path === scope.projectRoot) return true;
+  if (!within(path, cwd)) return false;
+  if (scope.roots.some(root => within(root, path))) return true;
+  if (!scope.isGit || !scope.roots.some(root => within(path, root))) return false;
+  // A broad local folder can group a repository when it is not itself another checkout root.
+  const parent = git(path, 'rev-parse', '--show-toplevel');
+  if (parent.status === 0) {
+    const root = directory(parent.stdout.replace(/\r?\n$/, ''));
+    return root !== null && root !== path;
+  }
+  return parent.status === 128 && /not a git repository/i.test(parent.stderr);
+}
+
+function resolveCallerProject(callers, scope, projects, { allowFallback = false } = {}) {
+  const groups = new Set(callers.map(row => row.projectId ?? null));
+  if (groups.size !== 1) return { reason: 'AMBIGUOUS_PROJECT' };
+  const paths = new Set(callers.map(row => directory(row.cwd)));
+  const [cwd] = paths;
+  if (paths.size !== 1 || repositoryMembership(cwd, scope) !== true) {
+    return { reason: 'AMBIGUOUS_THREAD_SCOPE' };
+  }
+
+  const [group] = groups;
+  if (group !== null) {
+    const project = projects.get(group);
+    return project && projectFits(project.path, cwd, scope)
+      ? { hostProjectId: group }
+      : { reason: 'AMBIGUOUS_PROJECT' };
+  }
+  if (allowFallback) {
+    const compatible = [...projects.values()].filter(project =>
+      (scope.roots.includes(project.path) || within(project.path, scope.projectRoot))
+      && projectFits(project.path, cwd, scope));
+    if (compatible.length === 1 && scope.roots.includes(compatible[0].path)) {
+      return { hostProjectId: compatible[0].id };
+    }
+  }
+  return { reason: 'AMBIGUOUS_PROJECT' };
+}
+
 function membership(thread, scope, projects, inRepository) {
   const owner = projects.get(thread.projectId);
   const exact = owner && scope.roots.includes(owner.path);
   if (exact) return inRepository !== false ? true : null;
-  if (inRepository === true) return !owner || scope.roots.some(root => within(owner.path, root)) ? true : null;
+  if (inRepository === true) {
+    return !owner || scope.roots.some(root => within(owner.path, root))
+      || repositoryMembership(owner.path, scope) === true ? true : null;
+  }
   if (inRepository === null && (!owner || scope.roots.some(root => within(owner.path, root)))) return null;
   return false;
 }
 
 export function assessControllerCandidate(scope, threadId, hostId, projectsResult, pages) {
-  let rows;
-  try { rows = readHistory(pages); } catch {}
-  if (!rows) return { reason: 'INCOMPLETE_HISTORY' };
-  const callerHosts = new Set(rows.filter(thread => thread.id === threadId).map(thread => thread.hostId));
+  const history = readHistory(pages);
+  if (!history) return { reason: 'INCOMPLETE_HISTORY' };
+  const rows = history.filter(thread => thread.archived !== true);
+  const callers = rows.filter(thread => thread.id === threadId);
+  const callerHosts = new Set(callers.map(thread => thread.hostId));
   if (callerHosts.size !== 1 || (hostId && !callerHosts.has(hostId))) return { reason: 'CALLER_NOT_FOUND' };
   const [observedHostId] = callerHosts;
-  let catalog;
-  try { catalog = unwrapHostResult(projectsResult).projects; } catch {}
-  if (!Array.isArray(catalog)) return { reason: 'AMBIGUOUS_PROJECT' };
-  const projects = new Map();
-  for (const project of catalog) {
-    if (project?.hostId !== observedHostId || !['local', 'remote'].includes(project.projectKind)) continue;
-    const projectPath = directory(project.path);
-    if (!projectPath || !text(project.projectId)) continue;
-    if (projects.has(project.projectId) && projects.get(project.projectId).path !== projectPath) {
-      return { reason: 'AMBIGUOUS_PROJECT' };
-    }
-    projects.set(project.projectId, { id: project.projectId, path: projectPath });
-  }
-  const suitable = [...projects.values()].filter(project => scope.roots.includes(project.path) ||
-    (scope.isGit && within(project.path, scope.projectRoot)))
-    .sort((a, b) => Number(b.path === scope.projectRoot) - Number(a.path === scope.projectRoot) ||
-      Number(scope.roots.includes(b.path)) - Number(scope.roots.includes(a.path)) ||
-      b.path.length - a.path.length);
-  const selected = suitable[0];
-  if (!selected) return { reason: 'AMBIGUOUS_PROJECT' };
-  const callerProjects = new Set(rows.filter(row => row.id === threadId && row.hostId === observedHostId)
-    .map(row => row.projectId));
-  const [callerProject] = callerProjects;
-  const equallySpecific = suitable.filter(project => (project.path === scope.projectRoot) === (selected.path === scope.projectRoot) &&
-    scope.roots.includes(project.path) === scope.roots.includes(selected.path) && project.path.length === selected.path.length);
-  const hostProject = equallySpecific.length === 1 ? selected
-    : equallySpecific.find(project => callerProjects.size === 1 && project.id === callerProject);
-  if (!hostProject) return { reason: 'AMBIGUOUS_PROJECT' };
+  const projects = readProjects(projectsResult, observedHostId);
+  if (!projects) return { reason: 'AMBIGUOUS_PROJECT' };
+  const binding = resolveCallerProject(callers, scope, projects, { allowFallback: true });
+  if (binding.reason) return binding;
 
   const members = new Map();
   const directories = new Map();
   for (const thread of rows) {
     if (thread.hostId !== observedHostId) continue;
-    if (!directories.has(thread.cwd)) directories.set(thread.cwd, repositoryMembership(thread.cwd, scope));
+    if (!directories.has(thread.cwd)) directories.set(thread.cwd, repositoryMembership(directory(thread.cwd), scope));
     const match = membership(thread, scope, projects, directories.get(thread.cwd));
     if (match === null || (members.has(thread.id) && members.get(thread.id) !== match)) {
       return { reason: 'AMBIGUOUS_THREAD_SCOPE' };
@@ -130,5 +178,32 @@ export function assessControllerCandidate(scope, threadId, hostId, projectsResul
   if (members.get(threadId) !== true) return { reason: 'CALLER_NOT_FOUND' };
   const matchingThreads = [...members.values()].filter(Boolean).length;
   if (matchingThreads !== 1) return { reason: 'MULTIPLE_THREADS', matchingThreads };
-  return { reason: 'CANDIDATE', hostId: observedHostId, hostProjectId: hostProject.id, matchingThreads };
+  return { reason: 'CANDIDATE', hostId: observedHostId, hostProjectId: binding.hostProjectId, matchingThreads };
+}
+
+export function validateProjectBinding(project, caller, projectsResult, pages) {
+  const { threadId, hostId } = project.controllerRef;
+  if (caller?.threadId !== threadId || (caller.hostId && caller.hostId !== hostId)) {
+    throw new HostContractError('CONTROLLER_REQUIRED', 'Project binding requires the registered controller conversation and host.');
+  }
+  const history = readHistory(pages, { requireComplete: false });
+  if (!history) throw new HostContractError('INCOMPLETE_HISTORY', 'Supply a contiguous Desktop history prefix starting at the first page.');
+  if (history.some(row => row.hostId !== hostId)) {
+    throw new HostContractError('HOST_MISMATCH', 'Desktop history must belong to the registered controller host.');
+  }
+  const callers = history.filter(row => row.id === threadId);
+  if (!callers.length || callers.some(row => row.archived !== undefined && row.archived !== false)) {
+    throw new HostContractError('CALLER_NOT_FOUND', 'Desktop history must confirm the active registered controller.');
+  }
+  const scope = resolveControllerScope(project.projectRoot);
+  if (!scope?.roots.includes(project.projectRoot)) {
+    throw new HostContractError('SCOPE_UNAVAILABLE', 'The registered project root is not a known checkout root.');
+  }
+  const projects = readProjects(projectsResult, hostId);
+  const binding = projects && resolveCallerProject(callers, scope, projects);
+  if (!binding?.hostProjectId) {
+    throw new HostContractError(binding?.reason ?? 'AMBIGUOUS_PROJECT',
+      'Desktop history and the local project catalog must identify a single group compatible with the registered checkout.');
+  }
+  return { projectId: project.projectId, hostProjectId: binding.hostProjectId, hostId, controllerThreadId: threadId };
 }

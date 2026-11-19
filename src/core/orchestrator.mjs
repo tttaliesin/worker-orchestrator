@@ -4,11 +4,13 @@ import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { SQLiteStore } from '../state/sqlite-store.mjs';
 import { OrchestratorError, requireCondition as check } from '../contracts/errors.mjs';
+import { decisionEvidence, isSupportedCheck, nextRetryProfile, object, parseEvaluation, parseWorkSpec, text }
+  from './structured-work.mjs';
 
 export { OrchestratorError } from '../contracts/errors.mjs';
 
-const COMMANDS = new Set(['candidate', 'project', 'dispatch', 'record', 'observe', 'resolve',
-  'verify', 'accept', 'archive', 'status']);
+const COMMANDS = new Set(['candidate', 'project', 'sync-project', 'dispatch', 'record', 'observe', 'resolve',
+  'evaluate', 'verify', 'accept', 'archive', 'status']);
 const PERMISSIONS = {
   create: 'createWorkers', send: 'sendFollowups',
   archive: 'archiveCompleted', unarchive: 'restoreWorkers',
@@ -16,18 +18,6 @@ const PERMISSIONS = {
 const OBSERVATIONS = new Set(['running', 'waiting_approval', 'waiting_input',
   'completed', 'failed', 'unknown']);
 const WAIT_KINDS = { waiting_approval: 'approval', waiting_input: 'input' };
-
-function object(value, name) {
-  check(value !== null && typeof value === 'object' && !Array.isArray(value),
-    'INVALID_INPUT', `${name} must be an object.`);
-  return value;
-}
-
-function text(value, name) {
-  check(typeof value === 'string' && value.trim().length > 0,
-    'INVALID_INPUT', `${name} must be a nonempty string.`);
-  return value;
-}
 
 function workerRef(value, name = 'workerRef') {
   object(value, name);
@@ -83,6 +73,7 @@ export class Orchestrator {
       const projectId = text(payload.projectId, 'projectId');
       const project = this.store.project(projectId);
       check(project, 'PROJECT_NOT_FOUND', `Project is not registered: ${projectId}`);
+      if (command === 'sync-project') return this.syncProject(project, payload, caller);
       if (command === 'status') {
         if (payload.taskId === undefined && payload.actionId === undefined) {
           return { project, tasks: this.store.tasks(projectId) };
@@ -97,22 +88,31 @@ export class Orchestrator {
       }
       if (project.authorization.scope === 'project') this.requireController(project, caller);
       text(payload.taskId, 'taskId');
-      if (command === 'dispatch') return this.dispatch(project, payload);
+      if (command === 'dispatch') {
+        if (payload.workSpec !== undefined) this.requireController(project, caller);
+        return this.dispatch(project, payload);
+      }
       const task = this.getTask(projectId, payload.taskId);
+      if (task.workSpec || command === 'evaluate') this.requireController(project, caller);
       if (command === 'record') return this.record(project, task, payload);
+      if (command === 'evaluate') return this.evaluate(project, task, payload);
       this.currentRun(task, text(payload.runId, 'runId'));
       if (command === 'observe') return this.observe(project, task, payload);
       if (command === 'resolve') return this.resolve(project, task, payload);
+      if (command === 'verify' || command === 'accept') {
+        check(!task.workSpec, 'STRUCTURED_EVALUATION_REQUIRED', 'Use evaluate for a run with a workSpec.');
+      }
       if (command === 'verify') return this.verify(project, task, payload);
       if (command === 'accept') return this.accept(project, task, payload);
       return this.archive(project, task, payload);
     });
   }
 
-  controllerCandidate({ projectRoot, roots, caller, claim = false, assessment = null }) {
+  controllerCandidate({ projectRoot, roots, caller, claim = false, assessment = null, includeStatus = false }) {
     const root = canonicalRoot(projectRoot);
     check(Array.isArray(roots) && roots.includes(root), 'INVALID_INPUT', 'roots must include the canonical project root.');
     check(typeof claim === 'boolean', 'INVALID_INPUT', 'claim must be a boolean.');
+    check(typeof includeStatus === 'boolean', 'INVALID_INPUT', 'includeStatus must be a boolean.');
     const threadId = text(caller?.threadId, 'caller.threadId');
     const hostId = caller.hostId ?? assessment?.hostId ?? null;
     if (hostId !== null) text(hostId, 'caller.hostId');
@@ -132,7 +132,8 @@ export class Orchestrator {
     }
     if (registered) {
       return registered.controllerRef.threadId === threadId
-        ? result('controller', 'REGISTERED_CONTROLLER', registered)
+        ? result('controller', 'REGISTERED_CONTROLLER', registered, false,
+          includeStatus ? { tasks: this.store.tasks(registered.projectId) } : {})
         : result('not_candidate', 'CONTROLLER_EXISTS', registered);
     }
     if (!assessment) return result('undetermined', 'DISCOVERY_REQUIRED');
@@ -205,6 +206,36 @@ export class Orchestrator {
     return { project, task: null, action: null, needsReconciliation: false };
   }
 
+  syncProject(project, input, caller) {
+    this.requireController(project, caller);
+    const hostProjectId = text(input.hostProjectId, 'hostProjectId');
+    const hostId = text(input.hostId, 'hostId');
+    const controllerThreadId = text(input.controllerThreadId, 'controllerThreadId');
+    check(hostId === project.controllerRef.hostId && caller.hostId === hostId
+      && controllerThreadId === project.controllerRef.threadId,
+    'CONTROLLER_REQUIRED', 'Project synchronization requires the registered controller and host.');
+    const previousHostProjectId = project.hostProjectId;
+    if (previousHostProjectId === hostProjectId) {
+      return { project, task: null, action: null, needsReconciliation: false };
+    }
+    const tasks = this.store.tasks(project.projectId);
+    const pending = tasks.find(task => task.pendingAction?.type === 'create');
+    check(!pending, 'PENDING_ACTION', 'Resolve the existing create action before synchronizing the project.',
+      pending ? { taskId: pending.taskId, actionId: pending.pendingAction.id } : undefined);
+    for (const task of tasks) {
+      if (task.workerRef && task.workerHostProjectId == null) {
+        task.workerHostProjectId = previousHostProjectId;
+        this.store.saveTask(task);
+      }
+    }
+    project.hostProjectId = hostProjectId;
+    project.updatedAt = new Date().toISOString();
+    this.store.db.prepare('UPDATE projects SET host_project_id = ?, json = ? WHERE project_id = ?')
+      .run(hostProjectId, JSON.stringify(project), project.projectId);
+    this.store.history('sync-project', { ...input, previousHostProjectId }, project);
+    return { project, task: null, action: null, needsReconciliation: false, previousHostProjectId };
+  }
+
   getTask(projectId, taskId) {
     const task = this.store.task(projectId, taskId);
     check(task, 'TASK_NOT_FOUND', `Task does not exist: ${taskId}`);
@@ -236,8 +267,19 @@ export class Orchestrator {
       { permission, source: project.authorization.source });
   }
 
+  workerProjectMatches(project, task) {
+    return task.workerHostProjectId == null || task.workerHostProjectId === project.hostProjectId;
+  }
+
+  requireWorkerProject(project, task) {
+    check(this.workerProjectMatches(project, task), 'WORKER_PROJECT_MISMATCH',
+      'The worker belongs to a different host project.',
+      { workerHostProjectId: task.workerHostProjectId, hostProjectId: project.hostProjectId });
+  }
+
   response(project, task, executable = true) {
-    const action = executable && !task.needsReconciliation ? task.pendingAction : null;
+    let action = executable && !task.needsReconciliation ? task.pendingAction : null;
+    if (['send', 'unarchive'].includes(action?.type) && !this.workerProjectMatches(project, task)) action = null;
     if (action) this.authorize(project, action.type);
     return { project, task, action, needsReconciliation: task.needsReconciliation };
   }
@@ -252,6 +294,9 @@ export class Orchestrator {
       prompt: task.prompt, profile: task.profile,
       workerRef: type === 'create' ? null : task.workerRef,
       hostProjectId: project.hostProjectId, controllerRef: project.controllerRef,
+      ...(task.workSpec && (type === 'create' || type === 'send' || type === 'unarchive')
+        ? { workSpec: task.workSpec } : {}),
+      ...(task.retryContext && type === 'send' ? { retryContext: task.retryContext } : {}),
     };
     check(type === 'create' || action.workerRef, 'INVALID_STATE', 'This action requires an existing worker.');
     this.store.db.prepare(`INSERT INTO actions(action_id, project_id, task_id, run_id, type, outcome, json)
@@ -266,16 +311,19 @@ export class Orchestrator {
     const requestId = text(input.requestId, 'requestId');
     const prompt = text(input.prompt, 'prompt');
     const requestedProfile = profile(input.profile);
-    let task = this.store.task(project.projectId, input.taskId);
+    const workSpec = parseWorkSpec(input.workSpec, requestedProfile.thinking);
+    const task = this.store.task(project.projectId, input.taskId);
     check(input.reuseOnly === undefined || typeof input.reuseOnly === 'boolean',
       'INVALID_INPUT', 'reuseOnly must be a boolean when specified.');
     check(input.reuseOnly !== true || task?.workerRef,
       'WORKER_NOT_FOUND', 'Reuse requires an existing bound worker.');
     const request = this.store.request(project.projectId, input.taskId, requestId);
     if (request) {
-      check(request.prompt === prompt && request.profile_json === JSON.stringify(requestedProfile),
-        'REQUEST_REPLAY_MISMATCH', 'requestId was already used with a different prompt or profile.');
+      check(request.prompt === prompt && request.profile_json === JSON.stringify(requestedProfile)
+        && isDeepStrictEqual(JSON.parse(request.json).workSpec, workSpec),
+      'REQUEST_REPLAY_MISMATCH', 'requestId was already used with a different prompt, profile, or workSpec.');
       const currentRequest = request.run_id === task.runId;
+      if (currentRequest && task.workerRef) this.requireWorkerProject(project, task);
       // A confirmed unarchive leaves the run planned without an action while send is unauthorized.
       if (currentRequest && task.phase === 'planned' && !task.pendingAction
         && project.authorization[PERMISSIONS.send] === true) {
@@ -286,36 +334,47 @@ export class Orchestrator {
       return this.response(project, task, currentRequest);
     }
     if (task) {
+      if (task.workerRef) this.requireWorkerProject(project, task);
       check(!task.pendingAction && !task.needsReconciliation && task.hostStatus !== 'unknown'
         && !['planned', 'running', 'waiting'].includes(task.phase),
         'TASK_BUSY', 'The task already has an active run or pending action.');
       check(task.waits.length === 0, 'UNRESOLVED_WAITS', 'Resolve all waits before starting another run.');
       check(task.workerRef || task.phase === 'rejected', 'INVALID_STATE',
         'An existing task must retain its worker identity unless creation was rejected.');
+      check(!task.workSpec || ['complete', 'rejected'].includes(task.phase),
+        'STRUCTURED_EVALUATION_REQUIRED', 'Evaluate the current structured work before starting another dispatch.');
     }
     const actionType = task?.workerRef ? task.archived ? 'unarchive' : 'send' : 'create';
     this.authorize(project, task?.workerRef ? 'send' : 'create');
     if (actionType === 'unarchive') this.authorize(project, actionType);
-    const runId = randomUUID();
+    return this.startRun(project, task, {
+      ...input, requestId, prompt, requestedProfile, workSpec, runId: randomUUID(),
+    }, actionType, input);
+  }
+
+  startRun(project, prior, run, actionType, historyInput) {
+    const { runId, requestId, prompt, requestedProfile, workSpec, retryContext } = run;
     const now = new Date().toISOString();
-    const existed = Boolean(task);
-    task = {
-      projectId: project.projectId, taskId: input.taskId, runId, requestId, prompt,
+    const task = {
+      projectId: project.projectId, taskId: run.taskId, runId, requestId, prompt,
       profile: requestedProfile, requestedProfile, effectiveProfile: null,
-      workerRef: task?.workerRef ?? null,
-      archived: task?.archived ?? false, phase: 'planned', hostStatus: null,
+      workerRef: prior?.workerRef ?? null,
+      ...(prior?.workerHostProjectId != null ? { workerHostProjectId: prior.workerHostProjectId } : {}),
+      ...(workSpec && { workSpec }),
+      ...(retryContext && { retryContext }),
+      archived: prior?.archived ?? false, phase: 'planned', hostStatus: null,
       pendingAction: null, needsReconciliation: false,
       verification: unverified(runId), accepted: false, resultReviewed: false,
       result: null, waits: [], resolvedWaits: [],
-      version: task?.version ?? 1, createdAt: task?.createdAt ?? now, updatedAt: now,
+      version: prior?.version ?? 1, createdAt: prior?.createdAt ?? now, updatedAt: now,
     };
-    if (!existed) this.store.saveTask(task, { insert: true });
+    if (!prior) this.store.saveTask(task, { insert: true });
     this.store.db.prepare(`INSERT INTO requests(project_id, task_id, request_id, run_id, prompt, profile_json, json)
       VALUES (?, ?, ?, ?, ?, ?, ?)`)
       .run(task.projectId, task.taskId, requestId, runId, prompt, JSON.stringify(requestedProfile), JSON.stringify(task));
     this.planAction(project, task, actionType);
     this.store.saveTask(task);
-    this.store.history('dispatch', input, project, task);
+    this.store.history('dispatch', historyInput, project, task);
     return this.response(project, task);
   }
 
@@ -354,7 +413,8 @@ export class Orchestrator {
     task.needsReconciliation = !terminal;
     if (terminal) {
       task.pendingAction = null;
-      if (action.type === 'unarchive' && project.authorization[PERMISSIONS.send] === true) {
+      if (action.type === 'unarchive' && project.authorization[PERMISSIONS.send] === true
+        && this.workerProjectMatches(project, task)) {
         this.planAction(project, task, 'send');
       }
     }
@@ -379,6 +439,7 @@ export class Orchestrator {
         .get(bound.hostId, bound.threadId, task.projectId, task.taskId);
       check(!collision, 'WORKER_IDENTITY_CONFLICT', 'That worker is already bound to another task.');
       task.workerRef = bound;
+      task.workerHostProjectId = action.hostProjectId;
       task.phase = 'running';
       task.hostStatus = 'running';
     } else {
@@ -418,6 +479,7 @@ export class Orchestrator {
     task.verification = unverified(task.runId);
     task.accepted = false;
     task.resultReviewed = false;
+    delete task.evaluation;
     if (Object.hasOwn(WAIT_KINDS, input.status)) {
       this.observeWaits(task, input, previousHostStatus);
       if (task.phase !== 'review') task.phase = task.waits.length ? 'waiting' : 'running';
@@ -496,6 +558,125 @@ export class Orchestrator {
     this.store.saveTask(task);
     this.store.history('resolve', input, project, task);
     return this.response(project, task, false);
+  }
+
+  evaluationObservation(task, resultEventId) {
+    const row = this.store.db.prepare(`SELECT event_id, json FROM events
+      WHERE project_id = ? AND task_id = ? AND run_id = ?
+      ORDER BY (json_extract(json, '$.status') IN ('completed', 'failed')) DESC, rowid DESC LIMIT 1`)
+      .get(task.projectId, task.taskId, task.runId);
+    check(row?.event_id === resultEventId, 'STALE_RESULT', 'Evaluation must identify the current result event.',
+      { currentResultEventId: row?.event_id, receivedResultEventId: resultEventId });
+    return JSON.parse(row.json);
+  }
+
+  evaluate(project, task, input) {
+    const runId = text(input.runId, 'runId');
+    if (runId !== task.runId) {
+      const row = this.store.db.prepare('SELECT json FROM requests WHERE project_id = ? AND task_id = ? AND run_id = ?')
+        .get(task.projectId, task.taskId, runId);
+      const prior = row && JSON.parse(row.json);
+      if (prior?.evaluation?.decision.type === 'retry') return this.replayDecision(project, task, prior, input);
+      this.currentRun(task, runId);
+    }
+    check(task.workSpec, 'WORK_SPEC_REQUIRED', 'Evaluation requires a run with a workSpec.');
+    const review = parseEvaluation(input, task.workSpec);
+    if (task.evaluation?.decision.type === 'complete') return this.replayDecision(project, task, task, input);
+    const observation = this.evaluationObservation(task, review.resultEventId);
+    const diagnostics = decisionEvidence(task.workSpec, review, observation);
+    const decision = { runId, resultEventId: review.resultEventId, diagnostics };
+
+    if (review.userDecision) {
+      return this.saveDecision(project, task, review, { ...decision, type: 'needs_user', ...review.userDecision });
+    }
+
+    const blocked = this.evaluationBlockers(task, diagnostics);
+    if (blocked.length) {
+      return this.saveDecision(project, task, review, { ...decision, type: 'blocked', reasons: blocked });
+    }
+    const outstanding = diagnostics.checks.filter(entry => !isSupportedCheck(entry));
+    if (outstanding.length === 0 && task.hostStatus === 'completed' && task.result?.success === true) {
+      return this.completeEvaluation(project, task, review, { ...decision, type: 'complete' });
+    }
+    return this.evaluateRetry(project, task, review, decision, outstanding);
+  }
+
+  evaluationBlockers(task, diagnostics) {
+    const reasons = [];
+    if (task.waits.length) reasons.push('UNRESOLVED_WAITS');
+    if (task.pendingAction || task.needsReconciliation) reasons.push('RECONCILIATION_REQUIRED');
+    if (task.phase !== 'review' || !['completed', 'failed'].includes(task.hostStatus)) {
+      reasons.push('RESULT_NOT_TERMINAL');
+    }
+    if (diagnostics.checks.some(entry => entry.status === 'met' && !isSupportedCheck(entry))) {
+      reasons.push('CONTROLLER_EVIDENCE_REQUIRED');
+    }
+    if (diagnostics.constraintReview && !isSupportedCheck(diagnostics.constraintReview)) {
+      reasons.push('CONSTRAINTS_NOT_CONFIRMED');
+    }
+    return reasons;
+  }
+
+  evaluateRetry(project, task, review, decision, outstanding) {
+    const reasons = [];
+    if (outstanding.length) reasons.push('CRITERIA_NOT_MET');
+    if (task.result?.success !== true) reasons.push('RESULT_NOT_SUCCESSFUL');
+    const requestedProfile = nextRetryProfile(task);
+    const blockers = [];
+    if (!this.workerProjectMatches(project, task)) blockers.push('WORKER_PROJECT_MISMATCH');
+    if (!project.authorization.sendFollowups) blockers.push('AUTHORIZATION_REQUIRED');
+    if (!requestedProfile) blockers.push('NO_HIGHER_EFFORT');
+    if (!task.workerRef || task.archived) blockers.push('WORKER_UNAVAILABLE');
+    if (blockers.length) {
+      return this.saveDecision(project, task, review, { ...decision, type: 'blocked', reasons: [...blockers, ...reasons] });
+    }
+
+    const nextRunId = randomUUID();
+    const requestId = randomUUID();
+    const retry = { ...decision, type: 'retry', nextRunId, requestId, profile: requestedProfile, reasons };
+    this.saveDecision(project, task, review, retry);
+    const retryContext = { previousRunId: task.runId, resultEventId: decision.resultEventId,
+      resultEvidenceRef: decision.diagnostics.resultEvidenceRef, workerVerification: decision.diagnostics.workerVerification,
+      checks: outstanding, constraintReview: decision.diagnostics.constraintReview, reasons };
+    const response = this.startRun(project, task, {
+      taskId: task.taskId, runId: nextRunId, requestId, prompt: task.prompt,
+      requestedProfile, workSpec: task.workSpec, retryContext,
+    }, 'send', { source: 'evaluate', previousRunId: task.runId, resultEventId: decision.resultEventId, requestId });
+    return { ...response, decision: retry };
+  }
+
+  saveDecision(project, task, input, decision) {
+    const evaluation = { input, decision };
+    if (!isDeepStrictEqual(task.evaluation, evaluation)) {
+      task.evaluation = evaluation;
+      this.store.saveTask(task);
+      this.store.history('evaluate', input, project, task);
+    }
+    return { ...this.response(project, task, false), decision };
+  }
+
+  completeEvaluation(project, task, review, decision) {
+    this.saveDecision(project, task, review, decision);
+    const { checks, constraintReview } = decision.diagnostics;
+    const evidenceRefs = [...checks.flatMap(entry => entry.controllerEvidenceRefs),
+      ...(constraintReview?.controllerEvidenceRefs ?? [])];
+    this.verify(project, task, { runId: task.runId, resultEventId: review.resultEventId, status: 'passed', evidenceRefs });
+    return { ...this.accept(project, task, { runId: task.runId, keepWorker: review.keepWorker }), decision };
+  }
+
+  replayDecision(project, task, prior, input) {
+    const { decision, input: original } = prior.evaluation;
+    const review = parseEvaluation(input, prior.workSpec);
+    check(review.resultEventId === original.resultEventId, 'STALE_RESULT', 'Evaluation must identify the decided result event.',
+      { currentResultEventId: original.resultEventId, receivedResultEventId: review.resultEventId });
+    check(isDeepStrictEqual(review, original), 'EVALUATION_REPLAY_MISMATCH',
+      'This result already produced a decision with different evaluation inputs.');
+    const action = task.pendingAction;
+    const retry = task.runId === decision.nextRunId && action?.type === 'send';
+    const archive = decision.type === 'complete' && task.runId === decision.runId && action?.type === 'archive';
+    const executable = (retry || archive) && project.authorization[PERMISSIONS[action.type]] === true
+      && (!retry || this.workerProjectMatches(project, task));
+    return { ...this.response(project, task, executable), decision };
   }
 
   verify(project, task, input) {
