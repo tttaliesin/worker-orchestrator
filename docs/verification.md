@@ -266,3 +266,90 @@ node --test --test-name-pattern='observe recovers from a valid wait poll from a 
 | B의 원문과 복구 결과 | `host-mismatch-actual-read-1.json`, `host-mismatch-recover-1.json` |
 | A의 독립 검증과 보관 | `call-error-marker-verification.json`, `call-error-archive-record.json` |
 | B의 독립 검증과 보관 | `host-mismatch-marker-verification.json`, `host-mismatch-archive-record.json` |
+
+## `v0.1.2` 릴리스 ZIP 설치와 실제 원문 복구 검증
+
+2026-11-19에 GitHub 릴리스 ZIP으로 Codex Desktop 플러그인을 `0.1.2`로 갱신했습니다.
+Codex가 설치된 두 스킬을 자동으로 발견했습니다.
+별도 상태 디렉터리를 사용한 실제 워커 대화 두 개에서 `read_thread` 원문 복구를 확인했습니다. [GitHub 릴리스](https://github.com/tttaliesin/worker-orchestrator/releases/tag/v0.1.2)
+
+### SHA-256 대조와 설치
+
+GitHub에서 `worker-orchestrator-v0.1.2-codex.zip`과 같은 이름에 `.sha256`을 붙인 체크섬 파일을 내려받았습니다.
+다운로드한 ZIP에서 직접 계산한 SHA-256이 첨부된 체크섬과 일치했습니다.
+
+```text
+c430aa9ddf71711e9ffff1617309c5f394d3072a50245343f541537315e942c1
+```
+
+ZIP 내부의 패키지 매니페스트에는 `releaseTag`가 `v0.1.2`, `revision`이 `f89b1cd6374b619531d2ae511e04aa6a664bf0d1`로 기록돼 있었습니다.
+같은 이름으로 등록된 개발 카탈로그를 압축 해제한 릴리스 카탈로그로 교체했습니다.
+설치 캐시의 파일 20개가 ZIP에서 푼 패키지 파일과 SHA-256 기준으로 일치했습니다.
+`codex plugin list --marketplace worker-orchestrator-local --json`에서 버전 `0.1.2`와 활성 상태를 확인했습니다.
+Windows 권한 검사 오류로 Desktop 화면 검증은 중단됐습니다.
+
+두 파일을 같은 디렉터리에 내려받은 뒤 그 디렉터리에서 체크섬을 대조하십시오.
+
+```powershell
+$ReleaseZip = 'worker-orchestrator-v0.1.2-codex.zip'
+$RecordedSha = ((Get-Content -Raw -LiteralPath "$ReleaseZip.sha256").Trim() -split '\s+', 2)[0]
+$ZipSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $ReleaseZip).Hash
+if ($ZipSha -ine $RecordedSha) { throw 'Release ZIP SHA-256 mismatch' }
+```
+
+### 스킬 자동 발견
+
+Codex app-server의 `skills/list`를 `stdio`로 호출해 저장소의 스킬 목록을 다시 읽었습니다.
+`0.1.2` 설치 캐시의 `worker-orchestrator:worker-controller`와 `worker-orchestrator:worker-executor`가 모두 활성 상태로 반환됐습니다.
+두 새 Desktop 워커의 사용 가능 스킬 목록에서도 두 스킬을 확인했습니다.
+각 워커가 실행한 설치본 CLI의 `--version`은 `0.1.2`였습니다.
+
+### 별도 상태 디렉터리를 사용한 이유
+
+Windows의 기본 상태 경로는 `%LOCALAPPDATA%/WorkerOrchestrator/state`입니다.
+개발 설치본이 쓰던 기본 DB의 `schema_migrations`를 읽기 전용으로 조회한 결과는 스키마 `3`이었습니다.
+릴리스 CLI의 `--version`이 보고한 `schemaVersion`은 `2`였습니다.
+`v0.1.2`에서는 지원 범위보다 높은 스키마를 가진 DB를 열 때 `UNSUPPORTED_SCHEMA`가 발생합니다.
+기존 개발 DB를 보존하면서 릴리스 동작을 확인할 수 있도록, 모든 검증 상태 명령에 별도 `--state-dir` 절대 경로를 전달했습니다.
+실측에는 `.local/desktop-install/release-v0.1.2-mwn5dhyn/worker-state/`를 사용했습니다.
+
+### 실제 복구 사례와 재현 절차
+
+실측에서는 두 호출의 `targets`에 각 워커의 `threadId`와 등록 호스트 ID `local`을 넣었습니다.
+아래 표의 응답은 실측 환경에서 관찰한 재현 조건입니다.
+
+| 사례 | 호출 경로 | `timeoutMs` | 실제 대기 응답 |
+| --- | --- | --- | --- |
+| A. 대기 호출 오류 | `mcp__codex_app__wait_threads` | `22000` | `isError: true`와 MCP 오류 `-32000`을 반환했습니다. |
+| B. 호스트 ID 불일치 | `codex_app__wait_threads` | `25000` | 파싱 가능한 JSON 요약에서 워커의 `threadId`는 일치했고 호스트 ID는 `remote-control:…`으로 보고됐습니다. |
+
+1. SHA-256 대조를 마친 ZIP을 GitHub 릴리스의 설치 절차에 따라 설치하십시오.
+2. 새 상태 디렉터리의 절대 경로를 모든 상태 명령의 `--state-dir`에 지정하십시오.
+3. 사용자 위임을 확인한 뒤 두 검증 워커를 시작하십시오. [v0.1.2 사용법](https://github.com/tttaliesin/worker-orchestrator/blob/v0.1.2/docs/usage.md)
+4. 각 워커에 현재 `runId`를 전달하십시오.
+   `tests/fixtures/worker-probe.mjs`로 `.local/live/markers/<runId>.json`에 `created` 마커를 만들고, `worker-executor` 형식의 최종 JSON을 반환하도록 요청하십시오.
+5. 표의 각 호출을 해당 워커에 실행하십시오.
+6. 해당 증상이 관찰되면 대기 응답을 원래 형식의 `hostResult`로 전달해 설치본 CLI의 `observe`를 호출하십시오.
+   입력에는 해당 실행의 `projectId`, `taskId`, `runId`와 대기 응답의 근거 경로인 `evidenceRef`를 포함하십시오.
+7. 결과의 `task.hostStatus`가 `unknown`이고 `needsReconciliation`이 `true`이면, 반환된 `hostCall` 인수로 등록 호스트의 `read_thread`를 실행하십시오.
+8. 조회 응답 `readThreadResult`와 원문 근거 경로 `readThreadEvidenceRef`를 같은 `observe` 입력에 추가해 다시 호출하십시오.
+
+두 사례 모두 원문의 워커 ID와 현재 `runId`가 일치했습니다.
+사례 B에서는 대기 요약과 원문의 턴 ID와 최종 메시지 ID도 일치했습니다.
+두 복구 결과는 모두 `task.hostStatus: completed`, `task.phase: review`, `needsReconciliation: false`였습니다.
+컨트롤러는 각 마커를 `scripts/verify-live-marker.mjs`로 독립 검증했습니다.
+복구 결과를 채택한 뒤 두 워커의 `archived: true`를 확인했습니다.
+
+실제 대기 응답에서 증상이 나타나지 않으면 위 절의 두 CLI 회귀 테스트로 각 입력을 확인할 수 있습니다.
+
+### 실측 증거
+
+원본은 Git에서 제외된 `.local/desktop-install/release-v0.1.2-mwn5dhyn/`에 있습니다.
+
+| 항목 | 대표 파일 |
+| --- | --- |
+| SHA-256 대조와 설치 버전 | `download-verification.json`, `installation-verification.json` |
+| 스킬 자동 발견 | `auto-discovery-verification.json` |
+| 사례 A의 조회 계획과 복구 | `wait-error-lookup.json`, `wait-error-recovered.json` |
+| 사례 B의 조회 계획과 복구 | `host-mismatch-lookup.json`, `host-mismatch-recovered.json` |
+| 원문 경로, 마커 검증, 보관을 포함한 요약 | `live-verification.json` |
