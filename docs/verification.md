@@ -353,3 +353,79 @@ Windows의 기본 상태 경로는 `%LOCALAPPDATA%/WorkerOrchestrator/state`입�
 | 사례 A의 조회 계획과 복구 | `wait-error-lookup.json`, `wait-error-recovered.json` |
 | 사례 B의 조회 계획과 복구 | `host-mismatch-lookup.json`, `host-mismatch-recovered.json` |
 | 원문 경로, 마커 검증, 보관을 포함한 요약 | `live-verification.json` |
+
+## `v0.1.4` 릴리스 ZIP 설치와 기본 DB 원문 복구 검증
+
+2026-11-19에 GitHub에서 새로 내려받은 `v0.1.4` 배포본을 Codex Desktop에 설치했습니다.
+기존 기본 SQLite DB를 사용한 두 실행에서 `read_thread` 원문 복구를 확인했습니다.
+
+### 배포본과 스킬 확인
+
+다운로드한 `worker-orchestrator-v0.1.4-codex.zip`의 SHA-256이 함께 배포된 `.sha256` 파일의 값과 일치했습니다. [v0.1.4 릴리스](https://github.com/tttaliesin/worker-orchestrator/releases/tag/v0.1.4)
+
+```text
+a296448437ed107d3f1f3f5cc733ab373161576875354cd20871ce51716634a7
+```
+
+ZIP의 패키지 매니페스트에서 `releaseTag: v0.1.4`와 `revision: 5815b9cce231a8f8a80c352f628b7de9ed30c9e9`를 확인했습니다.
+Codex 설치 캐시의 파일 20개가 ZIP에서 푼 파일과 SHA-256 기준으로 일치했습니다.
+`codex plugin list --marketplace worker-orchestrator-local --json`에서 버전 `0.1.4`와 활성 상태를 확인했습니다.
+설치본 CLI의 `--version`은 버전 `0.1.4`와 `schemaVersion: 3`을 반환했습니다.
+Codex app-server의 `skills/list`는 `worker-orchestrator:worker-controller`와 `worker-orchestrator:worker-executor`를 모두 활성 상태로 반환했습니다.
+두 워커의 사용 가능 스킬 목록에서도 두 스킬을 확인했습니다.
+
+ZIP과 체크섬 파일을 같은 디렉터리에 내려받으십시오.
+설치 전 해당 디렉터리에서 다음 PowerShell 명령으로 SHA-256을 대조하십시오.
+
+```powershell
+$ReleaseZip = 'worker-orchestrator-v0.1.4-codex.zip'
+$RecordedSha = ((Get-Content -Raw -LiteralPath "$ReleaseZip.sha256").Trim() -split '\s+', 2)[0]
+$ZipSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $ReleaseZip).Hash
+if ($ZipSha -ine $RecordedSha) { throw 'Release ZIP SHA-256 mismatch' }
+```
+
+### 기본 SQLite DB 확인
+
+Codex Desktop 호스트에서 `--state-dir`을 생략해 기존 `%LOCALAPPDATA%/WorkerOrchestrator/state/state.sqlite`를 사용했습니다.
+`candidate`는 기존 컨트롤러 대화에 `decision: controller`를 반환했습니다.
+같은 응답에서 기존 프로젝트 위임인 `authorization.scope: project`를 확인했습니다.
+설치 직후 `status`로 보관된 워커 두 개의 대화와 마지막 실행을 확인했습니다.
+기본 DB를 읽기 전용으로 조회해 스키마 `3`을 확인했습니다.
+워커를 재사용한 뒤 읽기 전용으로 다시 조회했을 때 두 워커의 이전 실행과 새 실행이 모두 남아 있었습니다.
+
+### 실제 복구 사례와 재현 절차
+
+실측에서는 두 호출 모두 `targets`에 대상 워커의 `threadId`와 등록 호스트 ID `local`을 넣었습니다.
+다음 표는 이 환경에서 관찰한 두 대기 응답입니다.
+
+| 사례 | 호출 경로 | `timeoutMs` | 실제 대기 응답 |
+| --- | --- | --- | --- |
+| A. 대기 호출 오류 | `mcp__codex_app__wait_threads` | `22000` | `isError: true`와 MCP 오류 `-32000`을 반환했습니다. |
+| B. 호스트 ID 불일치 | `codex_app__wait_threads` | `22000` | JSON 요약의 `polls[].thread.id`는 등록된 워커와 일치했습니다. `polls[].thread.hostId`는 `remote-control:`로 시작했습니다. |
+
+1. SHA-256 대조를 마친 ZIP을 풀어 Codex Desktop에 플러그인 `0.1.4`를 설치하십시오.
+2. 설치본 CLI의 `candidate`로 기존 컨트롤러 등록과 프로젝트 위임을 확인하십시오.
+   기본 DB에서 재현하려면 상태 명령에 `--state-dir`을 생략하십시오.
+3. 기존 검증 워커 두 개에 새 실행을 배정하십시오.
+   실측에서는 `dispatch`에 `reuseOnly: true`를 전달하고 보관된 워커를 복원했습니다. [v0.1.4 사용법](https://github.com/tttaliesin/worker-orchestrator/blob/v0.1.4/docs/usage.md)
+4. 각 워커에 현재 `runId`로 아래 명령을 실행한 뒤 `worker-executor` 형식의 최종 JSON을 반환해 달라고 요청하십시오.
+
+   ```text
+   node tests/fixtures/worker-probe.mjs <runId> reused .local/live/markers/<runId>.json
+   ```
+
+5. 표의 각 경로로 해당 워커의 `wait_threads`를 호출하십시오.
+6. 표의 증상이 관찰되면 원래 대기 응답을 `hostResult`로 전달해 설치본 CLI의 `observe`를 실행하십시오.
+   입력에는 같은 작업 범위의 `projectId`, `taskId`, 현재 `runId`와 대기 응답의 근거 경로인 `evidenceRef`를 포함하십시오.
+7. `task.hostStatus`가 `unknown`이고 `needsReconciliation`이 `true`이면 반환된 `hostCall`의 인수로 등록 호스트의 `read_thread`를 실행하십시오.
+8. 원래 `observe` 입력에 조회 응답 `readThreadResult`와 원문 근거 경로 `readThreadEvidenceRef`를 추가해 `observe`를 다시 실행하십시오.
+
+두 사례에서 등록된 워커의 최신 턴에 현재 `runId`가 담긴 유효한 최종 메시지가 있었습니다.
+사례 B에서는 대기 요약과 등록 호스트에서 조회한 원문의 턴 ID와 최종 메시지 ID가 각각 일치했습니다.
+복구 성공 기준은 원문 메시지와 그 근거가 기록되고 `task.hostStatus: completed`, `task.phase: review`, `needsReconciliation: false`가 반환되는 것입니다.
+두 실측 모두 이 기준을 충족했습니다.
+컨트롤러는 `scripts/verify-live-marker.mjs`로 각 실행의 마커를 독립 검증했습니다.
+컨트롤러는 `accept`에 `keepWorker: false`를 전달해 두 워커의 보관을 계획했습니다.
+실제 보관 응답을 `record`로 기록한 뒤 두 워커가 보관됐음을 확인했습니다.
+
+실제 호출에서 증상이 나타나지 않으면 두 CLI 회귀 테스트로 각 입력의 복구 동작을 확인할 수 있습니다. [회귀 테스트](../tests/cli/lifecycle.test.mjs)
