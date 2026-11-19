@@ -7,7 +7,7 @@ import { OrchestratorError, requireCondition as check } from '../contracts/error
 
 export { OrchestratorError } from '../contracts/errors.mjs';
 
-const COMMANDS = new Set(['project', 'dispatch', 'record', 'observe', 'resolve',
+const COMMANDS = new Set(['candidate', 'project', 'dispatch', 'record', 'observe', 'resolve',
   'verify', 'accept', 'archive', 'status']);
 const PERMISSIONS = {
   create: 'createWorkers', send: 'sendFollowups',
@@ -68,7 +68,7 @@ export class Orchestrator {
     this.store = new SQLiteStore(stateDir);
   }
 
-  execute(command, input = {}) {
+  execute(command, input = {}, caller = null) {
     check(COMMANDS.has(command), 'UNKNOWN_COMMAND', `Unknown command: ${String(command)}`);
     object(input, 'input');
     // Detach caller-owned objects so returned data cannot alter persisted snapshots.
@@ -78,7 +78,8 @@ export class Orchestrator {
       throw new OrchestratorError('INVALID_INPUT', 'input must be JSON serializable.', undefined, { cause: error });
     }
     return this.store.transaction(() => {
-      if (command === 'project') return this.registerProject(payload);
+      if (command === 'candidate') return this.controllerCandidate(payload);
+      if (command === 'project') return this.registerProject(payload, { caller });
       const projectId = text(payload.projectId, 'projectId');
       const project = this.store.project(projectId);
       check(project, 'PROJECT_NOT_FOUND', `Project is not registered: ${projectId}`);
@@ -94,6 +95,7 @@ export class Orchestrator {
         }
         return snapshot;
       }
+      if (project.authorization.scope === 'project') this.requireController(project, caller);
       text(payload.taskId, 'taskId');
       if (command === 'dispatch') return this.dispatch(project, payload);
       const task = this.getTask(projectId, payload.taskId);
@@ -107,7 +109,54 @@ export class Orchestrator {
     });
   }
 
-  registerProject(input) {
+  controllerCandidate({ projectRoot, roots, caller, claim = false, assessment = null }) {
+    const root = canonicalRoot(projectRoot);
+    check(Array.isArray(roots) && roots.includes(root), 'INVALID_INPUT', 'roots must include the canonical project root.');
+    check(typeof claim === 'boolean', 'INVALID_INPUT', 'claim must be a boolean.');
+    const threadId = text(caller?.threadId, 'caller.threadId');
+    const hostId = caller.hostId ?? assessment?.hostId ?? null;
+    if (hostId !== null) text(hostId, 'caller.hostId');
+    const result = (decision, reason, project = null, claimed = false, extra = {}) =>
+      ({ decision, reason, claimed, project, projectRoot: project?.projectRoot ?? root, ...extra });
+
+    const projects = this.store.projectsForRoots(roots);
+    if (projects.length > 1) return result('undetermined', 'CONFLICTING_REGISTRATION');
+    const [registered] = projects;
+    if (registered && hostId && registered.controllerRef.hostId !== hostId) {
+      return result('undetermined', 'HOST_MISMATCH');
+    }
+    const worker = this.store.workerProject(threadId, hostId ?? registered?.controllerRef.hostId);
+    if (worker) {
+      if (registered?.controllerRef.threadId === threadId) return result('undetermined', 'CONFLICTING_REGISTRATION');
+      return result('worker', 'REGISTERED_WORKER', worker);
+    }
+    if (registered) {
+      return registered.controllerRef.threadId === threadId
+        ? result('controller', 'REGISTERED_CONTROLLER', registered)
+        : result('not_candidate', 'CONTROLLER_EXISTS', registered);
+    }
+    if (!assessment) return result('undetermined', 'DISCOVERY_REQUIRED');
+    if (assessment.reason === 'MULTIPLE_THREADS') {
+      return result('not_candidate', assessment.reason, null, false, { matchingThreads: assessment.matchingThreads });
+    }
+    if (assessment.reason !== 'CANDIDATE') return result('undetermined', assessment.reason);
+    const controller = workerRef({ threadId, hostId: assessment.hostId }, 'controller');
+    if (hostId !== controller.hostId) return result('undetermined', 'HOST_MISMATCH');
+    const hostProjectId = text(assessment.hostProjectId, 'hostProjectId');
+    if (!claim) {
+      return result('candidate', 'CANDIDATE', null, false, { controllerRef: controller, hostProjectId, matchingThreads: 1 });
+    }
+    const { project } = this.registerProject({
+      projectId: randomUUID(), projectRoot: root, hostProjectId, controller,
+      authorization: {
+        ...Object.fromEntries(Object.values(PERMISSIONS).map(permission => [permission, false])),
+        source: 'Automatic controller registration does not grant conversation permissions.',
+      },
+    }, { firstClaim: true });
+    return result('controller', 'CONTROLLER_CLAIMED', project, true, { matchingThreads: 1 });
+  }
+
+  registerProject(input, { firstClaim = false, caller = null } = {}) {
     const projectId = text(input.projectId, 'projectId');
     const projectRoot = canonicalRoot(input.projectRoot);
     const hostProjectId = text(input.hostProjectId, 'hostProjectId');
@@ -118,28 +167,41 @@ export class Orchestrator {
       check(typeof authorization[permission] === 'boolean', 'INVALID_AUTHORIZATION',
         `authorization.${permission} must be an explicit boolean.`);
     }
+    check(authorization.scope === undefined || authorization.scope === 'project', 'INVALID_AUTHORIZATION',
+      'authorization.scope must be project when specified.');
     const prior = this.store.project(projectId);
+    if (authorization.scope === 'project' || prior?.authorization.scope === 'project') {
+      this.requireController(prior, caller);
+      check(sameWorker(prior.controllerRef, controller), 'CONTROLLER_REQUIRED',
+        'Updating project operation permissions must keep the registered controller.');
+    }
     if (prior) {
       check(prior.projectRoot === projectRoot && prior.hostProjectId === hostProjectId
         && prior.controllerRef.hostId === controller.hostId,
       'PROJECT_IDENTITY_CONFLICT', 'A registered project root and host project identity are fixed.');
+      check(prior.controllerSelection !== 'automatic' || sameWorker(prior.controllerRef, controller),
+        'CONTROLLER_ALREADY_REGISTERED', 'A permission update must use the automatically registered controller.');
     }
     const collision = this.store.db.prepare(`SELECT project_id FROM projects WHERE project_id != ?
-      AND (project_root = ? OR (host_id = ? AND host_project_id = ?))`)
-      .get(projectId, projectRoot, controller.hostId, hostProjectId);
+      AND (project_root = ? OR (? = 1 AND host_id = ? AND host_project_id = ?))`)
+      .get(projectId, projectRoot, Number(!firstClaim && !prior), controller.hostId, hostProjectId);
     check(!collision, 'PROJECT_IDENTITY_CONFLICT', 'That root or host project is already registered.',
       collision ? { projectId: collision.project_id } : undefined);
     const now = new Date().toISOString();
     const project = {
       projectId, projectRoot, hostProjectId, controller, controllerRef: controller,
-      authorization: Object.fromEntries([...Object.values(PERMISSIONS), 'source']
-        .map(key => [key, authorization[key]])),
+      ...(firstClaim || prior?.controllerSelection === 'automatic' ? {controllerSelection: 'automatic'} : {}),
+      authorization: {
+        ...Object.fromEntries([...Object.values(PERMISSIONS), 'source'].map(key => [key, authorization[key]])),
+        ...(authorization.scope === 'project' ? { scope: 'project' } : {}),
+      },
       createdAt: prior?.createdAt ?? now, updatedAt: now,
     };
+    const update = firstClaim ? '' : ' ON CONFLICT(project_id) DO UPDATE SET json = excluded.json';
     this.store.db.prepare(`INSERT INTO projects(project_id, project_root, host_id, host_project_id, json)
-      VALUES (?, ?, ?, ?, ?) ON CONFLICT(project_id) DO UPDATE SET json = excluded.json`)
+      VALUES (?, ?, ?, ?, ?)${update}`)
       .run(projectId, projectRoot, controller.hostId, hostProjectId, JSON.stringify(project));
-    this.store.history('project', input, project);
+    this.store.history(firstClaim ? 'claim_controller' : 'project', input, project);
     return { project, task: null, action: null, needsReconciliation: false };
   }
 
@@ -159,6 +221,12 @@ export class Orchestrator {
   currentRun(task, runId) {
     check(task.runId === runId, 'STALE_RUN', 'The run is no longer current.',
       { currentRunId: task.runId, receivedRunId: runId });
+  }
+
+  requireController(project, caller) {
+    check(project && caller?.threadId === project.controllerRef.threadId
+      && (!caller.hostId || caller.hostId === project.controllerRef.hostId),
+    'CONTROLLER_REQUIRED', 'Project operation permissions require the registered controller conversation.');
   }
 
   authorize(project, type) {
@@ -199,6 +267,10 @@ export class Orchestrator {
     const prompt = text(input.prompt, 'prompt');
     const requestedProfile = profile(input.profile);
     let task = this.store.task(project.projectId, input.taskId);
+    check(input.reuseOnly === undefined || typeof input.reuseOnly === 'boolean',
+      'INVALID_INPUT', 'reuseOnly must be a boolean when specified.');
+    check(input.reuseOnly !== true || task?.workerRef,
+      'WORKER_NOT_FOUND', 'Reuse requires an existing bound worker.');
     const request = this.store.request(project.projectId, input.taskId, requestId);
     if (request) {
       check(request.prompt === prompt && request.profile_json === JSON.stringify(requestedProfile),
@@ -467,7 +539,14 @@ export class Orchestrator {
   }
 
   accept(project, task, input) {
-    if (task.phase === 'complete' && task.accepted) return this.response(project, task, false);
+    check(input.keepWorker === undefined || typeof input.keepWorker === 'boolean',
+      'INVALID_INPUT', 'keepWorker must be a boolean when specified.');
+    const archiveOnAcceptance = input.keepWorker === false && project.authorization.scope === 'project'
+      && project.authorization.archiveCompleted === true;
+    if (task.phase === 'complete' && task.accepted) {
+      if (archiveOnAcceptance && task.pendingAction?.type === 'archive') return this.archive(project, task, input);
+      return this.response(project, task, false);
+    }
     check(task.phase === 'review', 'INVALID_PHASE', 'Only a reviewed terminal result can be accepted.');
     this.readyForAcceptance(task);
     check(input.resultReviewed === undefined || input.resultReviewed === true,
@@ -478,6 +557,7 @@ export class Orchestrator {
     task.phase = 'complete';
     this.store.saveTask(task);
     this.store.history('accept', input, project, task);
+    if (archiveOnAcceptance) return this.archive(project, task, input);
     return this.response(project, task, false);
   }
 

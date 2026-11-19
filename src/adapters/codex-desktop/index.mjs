@@ -41,7 +41,7 @@ export function capabilityDescription() {
     projectTarget: 'existing-project-local-checkout',
     model: { requestField: 'model', reasoningField: 'thinking', supportedThinking: [...THINKING], catalog: 'host-provided', appliedSettings: 'require-host-evidence' },
     permissions: 'Direct human authorization and host policy govern every conversation mutation',
-    supports: ['create', 'send', 'archive', 'unarchive', 'wait', 'observe'],
+    supports: ['candidate', 'project-operations', 'create', 'send', 'archive', 'unarchive', 'wait', 'observe'],
     limitations: ['No private Desktop API or database access', 'No automatic approval decisions', 'No background wakeup guarantee', 'No nested worker creation in this MVP']
   };
 }

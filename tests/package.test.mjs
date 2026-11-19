@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { access, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -9,6 +9,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
 import { buildPackage } from '../builders/codex/build.mjs';
 import { checkPackage } from '../scripts/check-package.mjs';
+import { Orchestrator } from '../src/core/orchestrator.mjs';
 import { createInstallation } from './installed/fixture.mjs';
 
 // A single build snapshot is copied per adversarial case; default dist/ is untouched.
@@ -41,7 +42,7 @@ test('relocated package validates itself and opens usable SQLite state with only
   const db = new DatabaseSync(path.join(fixture.stateDir, 'state.sqlite'), { readOnly: true });
   try {
     const versions = db.prepare('SELECT version FROM schema_migrations ORDER BY version').all();
-    assert.deepEqual(versions.map(row => row.version), [1, 2]);
+    assert.deepEqual(versions.map(row => row.version), [1, 2, 3]);
     assert.equal(db.prepare('SELECT COUNT(*) AS count FROM projects').get().count, 0);
   } finally {
     db.close();
@@ -61,6 +62,45 @@ test('installed package smoke rejects an existing file as the SQLite state direc
   assert.equal(failure.ok, false);
   assert.match(failure.error, /Installed CLI SQLite status failed:[\s\S]*"code": "STATE_ERROR"/);
   assert.equal(await readFile(stateDir, 'utf8'), 'keep this file');
+});
+
+test('installed package reads existing project authorization and worker bindings at the default state path', async () => {
+  const fixture = await installation;
+  const localAppData = path.join(fixture.sandbox, 'default-local-app-data');
+  const controller = { threadId: 'default-state-controller', hostId: 'local' };
+  const worker = { threadId: 'default-state-worker', hostId: 'local' };
+  const project = {
+    projectId: 'default-state-project', projectRoot: fixture.workspace, hostProjectId: 'default-state-host-project',
+    controller, authorization: { createWorkers: true, sendFollowups: true, archiveCompleted: true,
+      restoreWorkers: true, source: 'Existing test authorization' },
+  };
+  const scope = { projectId: project.projectId, taskId: 'existing-task' };
+  const authorization = { ...project.authorization, scope: 'project' };
+  const registry = new Orchestrator(path.join(localAppData, 'WorkerOrchestrator', 'state'));
+  let runId;
+  try {
+    registry.execute('project', project);
+    registry.execute('project', { ...project, authorization }, controller);
+    const dispatched = registry.execute('dispatch', { ...scope, requestId: 'existing-request',
+      prompt: 'Run the existing task.', profile: { model: 'fixture-model', thinking: 'low' } }, controller);
+    runId = dispatched.task.runId;
+    registry.execute('record', { ...scope, actionId: dispatched.action.id, outcome: 'succeeded',
+      receipt: { workerRef: worker }, evidenceRef: 'fixture:created-worker' }, controller);
+  } finally {
+    registry.close();
+  }
+
+  const installed = spawnSync(process.execPath, [path.join(fixture.root, 'dist/cli.mjs'), 'status', '--input', '-'], {
+    cwd: fixture.workspace, env: { ...process.env, LOCALAPPDATA: localAppData },
+    encoding: 'utf8', input: JSON.stringify(scope), windowsHide: true, timeout: 30_000,
+  });
+  assert.ifError(installed.error);
+  assert.equal(installed.status, 0, installed.stdout);
+  const result = JSON.parse(installed.stdout);
+  assert.deepEqual(result.project.authorization, authorization);
+  assert.deepEqual(result.project.controllerRef, controller);
+  assert.deepEqual(result.task.workerRef, worker);
+  assert.equal(result.task.runId, runId);
 });
 
 test('checker detects changed bytes even when a filename and byte count are unchanged', async () => {

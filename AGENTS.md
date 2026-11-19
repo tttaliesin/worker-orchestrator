@@ -14,6 +14,12 @@ Codex 도구 호출은 사용자 권한을 가진 컨트롤러 대화가 수행�
 - 후속 실행에 이전 검증 통과를 승계하지 않습니다.
 - 사용자 대화 도구와 일시적 subagent 도구를 혼동하지 않습니다.
 
+## Desktop 대화 역할
+
+설치된 CLI가 `candidate`를 지원하고 Codex Desktop 조회 도구를 사용할 수 있으면 일반 프로젝트 작업에서도 `worker-controller` 스킬로 대화 역할을 확인합니다.
+컨트롤러가 `runId`와 작업 범위를 전달한 워커는 `worker-executor` 스킬을 사용합니다.
+컨트롤러로 확인된 대화는 계획, 허가된 워커 배정, 관찰, 검증과 보고를 맡습니다.
+
 ## 검증과 산출물
 
 `npm test`, `npm run build`, `npm run check`로 검증합니다.

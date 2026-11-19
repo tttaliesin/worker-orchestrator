@@ -90,7 +90,21 @@ const MIGRATION_V2 = `
     ON actions(project_id, task_id) WHERE outcome NOT IN ('succeeded', 'rejected');
 `;
 
-const migrations = [MIGRATION_V1, MIGRATION_V2];
+const MIGRATION_V3 = `
+  CREATE TABLE projects_v3 (
+    project_id TEXT PRIMARY KEY,
+    project_root TEXT NOT NULL UNIQUE,
+    host_id TEXT NOT NULL,
+    host_project_id TEXT NOT NULL,
+    json TEXT NOT NULL
+  );
+  INSERT INTO projects_v3 SELECT project_id, project_root, host_id, host_project_id, json FROM projects;
+  DROP TABLE projects;
+  ALTER TABLE projects_v3 RENAME TO projects;
+  CREATE INDEX projects_by_host_project ON projects(host_id, host_project_id);
+`;
+
+const migrations = [MIGRATION_V1, MIGRATION_V2, MIGRATION_V3];
 export const SCHEMA_VERSION = migrations.length;
 
 /** All read/modify/write commands hold one cross-process SQLite write lock. */
@@ -104,7 +118,8 @@ export class SQLiteStore {
     try {
       mkdirSync(this.stateDir, { recursive: true });
       this.db = new DatabaseSync(this.databasePath);
-      this.db.exec('PRAGMA busy_timeout = 10000; PRAGMA foreign_keys = ON;');
+      // Rebuilding a referenced table requires foreign keys to be disabled outside the transaction.
+      this.db.exec('PRAGMA busy_timeout = 10000; PRAGMA foreign_keys = OFF;');
       // Migrations themselves are serialized, including first-open races.
       this.transaction(() => {
         this.db.exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -119,7 +134,12 @@ export class SQLiteStore {
           this.db.prepare('INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)')
             .run(version, new Date().toISOString());
         }
+        if (versions.length < SCHEMA_VERSION) {
+          requireCondition(!this.db.prepare('PRAGMA foreign_key_check').get(),
+            'STATE_CONFLICT', 'Migrating the state database left an invalid foreign key.');
+        }
       });
+      this.db.exec('PRAGMA foreign_keys = ON;');
     } catch (error) {
       this.db?.close();
       this.closed = true;
@@ -153,6 +173,19 @@ export class SQLiteStore {
   project(projectId) {
     const row = this.db.prepare('SELECT json FROM projects WHERE project_id = ?').get(projectId);
     return row ? JSON.parse(row.json) : null;
+  }
+
+  projectsForRoots(roots) {
+    const placeholders = roots.map(() => '?').join(', ');
+    return this.db.prepare(`SELECT json FROM projects WHERE project_root IN (${placeholders})`)
+      .all(...roots).map(row => JSON.parse(row.json));
+  }
+
+  workerProject(threadId, hostId) {
+    const row = hostId
+      ? this.db.prepare('SELECT project_id FROM tasks WHERE worker_host_id = ? AND worker_thread_id = ?').get(hostId, threadId)
+      : this.db.prepare('SELECT project_id FROM tasks WHERE worker_thread_id = ?').get(threadId);
+    return row ? this.project(row.project_id) : null;
   }
 
   task(projectId, taskId) {

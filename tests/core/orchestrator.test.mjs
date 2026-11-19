@@ -462,7 +462,7 @@ test('reopening retains task, events, and history without reapplying migrations'
   f.core = f.open();
   assert.deepEqual(f.core.execute('status', { projectId: 'p1' }), before);
   f.db(db => {
-    assert.deepEqual(db.prepare('SELECT version FROM schema_migrations ORDER BY version').all().map(row => row.version), [1, 2]);
+    assert.deepEqual(db.prepare('SELECT version FROM schema_migrations ORDER BY version').all().map(row => row.version), [1, 2, 3]);
     assert.equal(db.prepare('SELECT count(*) AS n FROM events').get().n, 1);
     assert.ok(db.prepare('SELECT count(*) AS n FROM history').get().n >= 6);
     const saved = JSON.parse(db.prepare('SELECT json FROM requests').get().json);
@@ -499,7 +499,7 @@ test('migrating a V1 database preserves a pending create and allows recovery aft
       DROP TABLE actions_v2_fixture;
       CREATE UNIQUE INDEX one_pending_action_per_task
         ON actions(project_id, task_id) WHERE outcome != 'succeeded';
-      DELETE FROM schema_migrations WHERE version = 2;
+      DELETE FROM schema_migrations WHERE version >= 2;
     `);
   });
   f.core = f.open();
@@ -538,6 +538,32 @@ test('migrating a V1 database preserves a pending create and allows recovery aft
   assert.equal(f.db(db => db.prepare('SELECT count(*) AS n FROM tasks').get().n), 1);
   assert.deepEqual(f.db(db => db.prepare('SELECT outcome FROM actions ORDER BY rowid').all().map(row => row.outcome)),
     ['rejected', 'succeeded']);
+});
+
+test('migrating a V2 registry retains its existing action and referential integrity', t => {
+  const f = fixture(t);
+  const planned = f.dispatch();
+  const before = f.core.execute('status', f.input({ actionId: planned.action.id }));
+  f.core.close();
+  f.db(db => db.exec(`
+    PRAGMA foreign_keys = OFF;
+    CREATE TABLE projects_v2_fixture (
+      project_id TEXT PRIMARY KEY,
+      project_root TEXT NOT NULL UNIQUE,
+      host_id TEXT NOT NULL,
+      host_project_id TEXT NOT NULL,
+      json TEXT NOT NULL,
+      UNIQUE (host_id, host_project_id)
+    );
+    INSERT INTO projects_v2_fixture SELECT * FROM projects;
+    DROP TABLE projects;
+    ALTER TABLE projects_v2_fixture RENAME TO projects;
+    DELETE FROM schema_migrations WHERE version = 3;
+  `));
+  f.core = f.open();
+  assert.deepEqual(f.core.execute('status', f.input({ actionId: planned.action.id })), before);
+  assert.deepEqual(f.record(planned.action).task.workerRef, worker);
+  f.db(db => assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []));
 });
 
 const contenderSource = `
@@ -588,7 +614,7 @@ test('six cold-start processes sharing SQLite produce one run and one planned cr
     assert.equal(new Set(outputs.map(output => output.result.action.id)).size, 1);
     assert.equal(new Set(outputs.map(output => output.result.task.runId)).size, 1);
     f.db(db => {
-      assert.equal(db.prepare('SELECT count(*) AS n FROM schema_migrations').get().n, 2);
+      assert.equal(db.prepare('SELECT count(*) AS n FROM schema_migrations').get().n, 3);
       for (const table of ['projects', 'tasks', 'requests', 'actions']) {
         assert.equal(db.prepare(`SELECT count(*) AS n FROM ${table}`).get().n, 1, table);
       }

@@ -6,6 +6,9 @@ import { pathToFileURL } from 'node:url';
 import { Orchestrator } from '../core/orchestrator.mjs';
 import { SCHEMA_VERSION } from '../state/sqlite-store.mjs';
 import { capabilityDescription, hostCallFor, receiptFromHost, observationFromWait, validateProfile } from '../adapters/codex-desktop/index.mjs';
+import { assessControllerCandidate, resolveControllerScope } from '../adapters/codex-desktop/controller-candidate.mjs';
+
+const commands = ['candidate', 'project', 'dispatch', 'record', 'observe', 'resolve', 'verify', 'accept', 'archive', 'status'];
 
 function options(argv) {
   const [command, ...args] = argv;
@@ -28,16 +31,37 @@ export function main(argv = process.argv.slice(2), packagedVersion) {
       fs.readFileSync(new URL('../../package.json', import.meta.url), 'utf8')
     ).version;
     if (opts.command === '--version' || opts.command === 'version') { console.log(JSON.stringify({name:'worker-orchestrator',version,schemaVersion:SCHEMA_VERSION})); return 0; }
-    if (opts.command === '--help' || !opts.command) { console.log(JSON.stringify({usage:'node dist/cli.mjs <command> --state-dir <absolute-directory> --input <json-file|->',commands:['project','dispatch','record','observe','resolve','verify','accept','archive','status','capabilities'],hostExecution:'The authorized controller performs returned hostCall, then records the real result.'})); return 0; }
+    if (opts.command === '--help' || !opts.command) { console.log(JSON.stringify({usage:'node dist/cli.mjs <command> --state-dir <absolute-directory> --input <json-file|->',commands:[...commands, 'capabilities'],hostExecution:'The authorized controller performs returned hostCall, then records the real result.'})); return 0; }
     if (opts.command === 'capabilities') { console.log(JSON.stringify({ok:true,...capabilityDescription()})); return 0; }
-    const supported = ['project','dispatch','record','observe','resolve','verify','accept','archive','status'];
-    if (!supported.includes(opts.command)) throw Object.assign(new Error(`Unknown command: ${opts.command}`),{code:'INPUT'});
+    if (!commands.includes(opts.command)) throw Object.assign(new Error(`Unknown command: ${opts.command}`),{code:'INPUT'});
     if (!opts['--input']) throw Object.assign(new Error('--input is required'),{code:'INPUT'});
     const input = JSON.parse(fs.readFileSync(opts['--input'] === '-' ? 0 : opts['--input'], 'utf8').replace(/^\uFEFF/, ''));
     if (!input || typeof input !== 'object' || Array.isArray(input)) throw Object.assign(new Error('Input must be a JSON object'),{code:'INPUT'});
     if (opts.command === 'dispatch') validateProfile(input.profile);
+    const threadId = process.env.CODEX_THREAD_ID?.trim();
+    const hostId = process.env.CODEX_HOST_ID?.trim() || null;
+    const caller = threadId ? { threadId, hostId } : null;
     const stateDir = opts['--state-dir'] ?? path.join(process.env.LOCALAPPDATA ?? path.join(os.homedir(), '.local', 'share'), 'WorkerOrchestrator', 'state');
     if (!path.isAbsolute(stateDir)) throw Object.assign(new Error('--state-dir must be absolute'),{code:'INPUT'});
+    if (opts.command === 'candidate') {
+      if (Object.hasOwn(input, 'claim') && typeof input.claim !== 'boolean') {
+        throw Object.assign(new Error('claim must be a boolean.'), {code:'INPUT'});
+      }
+      const scope = threadId ? resolveControllerScope(input.projectRoot ?? process.cwd()) : null;
+      let result = { decision: 'undetermined', reason: threadId ? 'SCOPE_UNAVAILABLE' : 'MISSING_CURRENT_THREAD',
+        claimed: false, project: null };
+      if (scope) {
+        app = new Orchestrator(stateDir);
+        const request = { ...scope, caller, claim: input.claim ?? false };
+        result = app.execute('candidate', request);
+        if (result.reason === 'DISCOVERY_REQUIRED' && (Object.hasOwn(input, 'threadPages') || Object.hasOwn(input, 'projects'))) {
+          const assessment = assessControllerCandidate(scope, threadId, hostId, input.projects, input.threadPages);
+          result = app.execute('candidate', { ...request, assessment });
+        }
+      }
+      console.log(JSON.stringify({ ok: true, version, ...result }, null, 2));
+      return 0;
+    }
     app = new Orchestrator(stateDir);
     let hostIssue;
     let readThread;
@@ -83,14 +107,14 @@ export function main(argv = process.argv.slice(2), packagedVersion) {
       }
     }
     let result;
-    try { result = app.execute(opts.command, input); }
+    try { result = app.execute(opts.command, input, caller); }
     catch (error) {
       if (!recordingHostResult || input.outcome !== 'succeeded'
         || !['WORKER_IDENTITY_CONFLICT', 'INVALID_RECEIPT'].includes(error.code)) throw error;
       // The call may already have had an external effect even when the local
       // domain rejects its receipt (e.g. duplicate worker identity).
       hostIssue = {code:error.code ?? 'HOST_CONTRACT',message:error.message};
-      result = app.execute('record', {projectId:input.projectId,taskId:input.taskId,actionId:input.actionId,outcome:'unknown',receipt:{},evidenceRef:input.evidenceRef});
+      result = app.execute('record', {projectId:input.projectId,taskId:input.taskId,actionId:input.actionId,outcome:'unknown',receipt:{},evidenceRef:input.evidenceRef}, caller);
     }
     const response = {ok:true,version,...result};
     if (hostIssue) { response.ok=false; response.hostError=hostIssue; }
