@@ -13,9 +13,11 @@ CLI는 대화 도구 호출 계획을 출력하고 실제 호스트 호출은 �
 `outcome: rejected`는 호스트가 실행 전에 `create`를 거절했음이 확인됐을 때 증거 참조와 함께 사용합니다.
 거절된 실행은 종료되며 같은 작업에 새 `requestId`로 생성 계획을 요청할 수 있습니다.
 `observe` 입력은 `projectId`, `taskId`, `runId`, `eventId`, `status`, `evidenceRef`를 받습니다.
-Codex의 원문 대기 결과를 `hostResult`로 전달할 때 최종 JSON 해석에 실패하면 읽기 전용 `hostCall`을 반환할 수 있습니다.
+Codex의 `wait_threads` 응답은 `hostResult`로 받습니다.
+호출 오류, 같은 워커의 호스트 ID 불일치 또는 최종 JSON 해석 실패가 확인되면 읽기 전용 `hostCall`을 반환할 수 있습니다.
 조회 결과를 받으면 같은 `hostResult`와 `evidenceRef`에 `readThreadResult`와 `readThreadEvidenceRef`를 추가해 `observe`를 다시 호출합니다.
-`readThreadResult`는 등록된 워커 호스트에서 조회한 같은 턴과 메시지의 원문이어야 합니다.
+CLI는 등록된 워커 호스트의 원문에서 현재 `runId`를 확인합니다.
+요약에 터미널 턴과 최종 메시지의 ID가 있으면 CLI는 원문 식별자와 대조합니다.
 status는 `running`, `waiting_approval`, `waiting_input`, `completed`, `failed`, `unknown`입니다.
 대기 시 `waitId` 또는 `waits: [{waitId, kind}]`를 포함합니다.
 `kind`는 `approval` 또는 `input`이며 대기 상태는 배열의 첫 항목에 대응합니다.

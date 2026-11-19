@@ -109,13 +109,16 @@ $InputObject | ConvertTo-Json -Depth 40 -Compress |
 ```
 
 공식 wait 응답은 `status`와 `eventId` 대신 원문 `hostResult`로 전달할 수도 있습니다.
-최종 메시지의 JSON을 해석할 수 없고 턴과 메시지의 ID가 있으면 `observe`가 읽기 전용 `read_thread` 호출 계획을 반환합니다.
-컨트롤러는 `hostCall`의 인수로 원문을 바로 조회합니다.
-이어서 같은 `observe` 입력에 조회 응답 `readThreadResult`와 근거 참조 `readThreadEvidenceRef`를 더해 호출합니다.
-등록된 워커 호스트에서 동일한 턴과 최종 메시지 ID를 확인한 경우에 원문 결과를 기록합니다.
-조회가 실패하거나 식별자가 다르면 확인할 수 있는 대기 상태나 미확인 상태로 남습니다.
-원문 완료 판정은 워커 최종 JSON의 최상위 `runId`가 현재 실행과 일치해야 합니다.
-이전 실행의 완료 응답으로 새 실행을 완료 처리하지 않습니다.
+호출에 실패한 경우 컨트롤러는 `isError: true`인 응답도 `hostResult`로 전달합니다.
+같은 워커의 요약이 다른 호스트 ID를 반환하거나 최종 메시지의 JSON을 해석할 수 없을 때도 원문 조회를 계획할 수 있습니다.
+
+1. `observe`가 `read_thread` 계획을 반환하면 `hostCall`의 인수로 등록된 호스트에서 원문을 조회하십시오.
+2. 같은 `observe` 입력에 `readThreadResult`와 `readThreadEvidenceRef`를 추가해 다시 호출하십시오.
+
+CLI는 등록된 호스트의 최종 응답에서 현재 `runId`를 확인합니다.
+요약에 터미널 턴과 최종 메시지의 ID가 있으면 CLI는 원문 식별자와 대조합니다.
+조회가 실패하거나 식별자가 다르면 CLI는 확인된 대기 상태나 미확인 상태를 유지합니다.
+
 정규화한 입력을 직접 작성할 때 `eventId`는 같은 작업의 실행 전체에서 고유해야 합니다.
 승인 대기는 `status: waiting_approval`과 `waitId`를 기록합니다.
 사용자 입력 대기는 `status: waiting_input`과 `waitId`를 기록합니다.

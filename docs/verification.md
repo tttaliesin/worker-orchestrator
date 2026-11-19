@@ -191,3 +191,78 @@ if ($RecoveryMarkerData.runId -ne $RecoveryRunId -or $RecoveryMarkerData.phase -
 이 디렉터리의 `reports/proof.json`은 실측 요약입니다.
 가공 전 응답은 `responses/probe-wait-compact.json`과 `responses/probe-read-original.json`에 있습니다.
 자동 테스트는 `node --test --test-name-pattern='collapsed Windows path' tests/cli/lifecycle.test.mjs`로 실행할 수 있습니다.
+
+## `wait_threads` 호출 오류와 호스트 ID 불일치 자동 복구 검증
+
+2026-11-19에 실제 Codex Desktop에서 `wait_threads` 호출 오류와 호스트 불일치가 각각 발생한 두 워커를 검증했습니다.
+두 사례에서 설치본 CLI가 등록된 워커의 원문을 조회하는 계획을 반환했고, 원문으로 현재 실행의 성공 결과를 기록했습니다.
+
+### 설치본 확인
+
+당시 작업 트리에서 빌드한 `worker-orchestrator@worker-orchestrator-local` 0.1.0을 Codex Desktop에 설치했습니다.
+패키지 검사에 표시된 `cb5c2f8`은 빌드 당시 작업 트리의 기준 HEAD입니다.
+빌드 산출물과 설치본의 패키지 매니페스트·어댑터·컨트롤러 스킬 SHA-256을 각각 대조해 일치를 확인했습니다.
+패키지 검사가 통과했고, 설치 경로의 `dist/cli.mjs`에서 `capabilities`가 실행되는 것도 확인했습니다.
+
+등록된 로컬 카탈로그에서 같은 방식으로 새 빌드를 설치하려면 저장소 루트에서 다음 명령을 실행하십시오.
+
+```powershell
+npm run build
+if ($LASTEXITCODE -ne 0) { throw 'Plugin build failed' }
+$WaitRecoveryInstall = codex plugin add 'worker-orchestrator@worker-orchestrator-local' --json | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0) { throw 'Plugin install failed' }
+node (Join-Path $WaitRecoveryInstall.installedPath 'dist/cli.mjs') capabilities
+```
+
+### 실제 대화 실행
+
+| 사례 | 실제 호출 경로 | 실제 대기 응답 |
+| --- | --- | --- |
+| A. MCP 호출 오류 | `mcp__codex_app__wait_threads` | 응답이 `isError: true`와 MCP 오류 `-32000`을 반환했습니다. |
+| B. 호스트 ID 불일치 | `codex_app__wait_threads` | 유효한 JSON 요약에서 워커의 `threadId`는 일치했고, 호스트 ID는 `remote-control:…`으로 보고됐습니다. |
+
+컨트롤러는 보관된 검증 워커 두 개를 복원했습니다.
+컨트롤러는 각 워커에 새 `runId`로 작업을 전달했습니다.
+컨트롤러는 `scripts/verify-live-marker.mjs`로 A의 `reused` marker와 B의 `restored` marker를 각각 독립 검증했습니다.
+컨트롤러는 두 실행 모두 검증 통과를 기록하고 결과를 채택했습니다.
+두 워커의 실제 Desktop 보관 응답을 기록한 뒤 각 작업의 `archived: true`를 확인했습니다.
+
+### 재현 절차
+
+실측에서는 두 호출의 `targets`에 해당 워커의 `threadId`와 등록 호스트인 `hostId: "local"`을 넣었습니다.
+`timeoutMs`는 사례 A에서 `20000`, 사례 B에서 `15000`을 사용했습니다.
+실제 대기 응답에서 표에 기록된 증상이 발생하면 해당 사례의 복구를 확인할 수 있습니다.
+
+1. [사용법](usage.md)에 따라 같은 작업에 새 `requestId`로 후속 실행을 시작합니다.
+2. 새 `runId`를 워커에 전달하고, 해당 실행의 marker를 생성한 뒤 최종 JSON을 반환하도록 요청합니다.
+3. 등록된 워커를 대상으로 해당 사례의 경로에서 `wait_threads`를 호출합니다.
+4. 재현 조건이 성립하면 실제 응답을 `hostResult`로, 해당 응답의 근거 경로를 `evidenceRef`로 전달해 설치본 CLI의 `observe`를 실행합니다.
+5. 응답의 `task.hostStatus`가 `unknown`이고 `needsReconciliation`이 `true`이면 반환된 `hostCall`의 인수로 등록 호스트의 `read_thread`를 실행합니다.
+6. 같은 `projectId`, `taskId`, `runId`와 기존 입력을 유지한 채 `readThreadResult`와 `readThreadEvidenceRef`를 추가해 `observe`를 다시 실행합니다.
+
+두 경로 모두 등록된 워커의 최신 턴에서 현재 `runId`를 담은 유효한 최종 메시지를 확인해야 합니다.
+호스트 불일치에서는 요약과 원문의 턴 ID 및 최종 메시지 ID도 대조합니다.
+복구에 성공하면 설치본 CLI는 원문 메시지와 그 증거 경로를 기록하고 `task.phase: review`, `task.hostStatus: completed`, `needsReconciliation: false`를 반환합니다.
+원문 조회가 실패하거나 식별자가 일치하지 않으면 작업은 미확정 상태로 남습니다.
+
+현재 환경에서 실제 증상이 발생하지 않으면 저장소 루트에서 각 CLI 회귀 테스트를 별도로 실행합니다.
+
+```text
+node --test --test-name-pattern='observe recovers from a wait_threads MCP error' tests/cli/lifecycle.test.mjs
+node --test --test-name-pattern='observe recovers from a valid wait poll from a remote-control host' tests/cli/lifecycle.test.mjs
+```
+
+### 실측 증거
+
+증거는 Git에서 제외된 `.local/desktop-install/wait-read-recovery-live-mwn24jn8/`에 있습니다.
+
+| 항목 | 대표 파일 |
+| --- | --- |
+| 실측 요약 | `summary.json` |
+| 빌드 및 설치 확인 | `build-verification.json`, `installed-verification.json` |
+| A의 대기 응답과 조회 계획 | `call-error-actual-wait.json`, `call-error-lookup-1.json` |
+| B의 대기 응답과 조회 계획 | `host-mismatch-actual-wait.json`, `host-mismatch-lookup-1.json` |
+| A의 원문과 복구 결과 | `call-error-actual-read-1.json`, `call-error-recover-1.json` |
+| B의 원문과 복구 결과 | `host-mismatch-actual-read-1.json`, `host-mismatch-recover-1.json` |
+| A의 독립 검증과 보관 | `call-error-marker-verification.json`, `call-error-archive-record.json` |
+| B의 독립 검증과 보관 | `host-mismatch-marker-verification.json`, `host-mismatch-archive-record.json` |

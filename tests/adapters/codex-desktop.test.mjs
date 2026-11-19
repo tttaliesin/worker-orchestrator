@@ -344,7 +344,12 @@ test('an alternate host only supplies compact correlation keys for a read on the
 });
 test('prefers a matching registered poll, accepts omitted hosts, and limits other-host polls to recovery', () => {
   const validAlternate = {...alternateHostPoll, latestAssistantMessage: finalMessage(completedResult)};
-  assert.throws(() => observePoll(validAlternate), {code: 'HOST_CONTRACT'});
+  const compact = observePoll(validAlternate);
+  assert.equal(compact.status, 'unknown');
+  assert.equal(compact.result, undefined);
+  assert.deepEqual(compact.readThread, {
+    ...workerRef, turnLimit: 1, includeOutputs: false, maxOutputCharsPerItem: 12000
+  });
   const observe = (...polls) => observationFromWait({polls}, workerRef, 'r', 'evidence');
   assert.throws(() => observe(alternateHostPoll, {...alternateHostPoll}), {code: 'HOST_CONTRACT'});
   assert.throws(() => observe({...alternateHostPoll, thread: {...alternateHostPoll.thread, id: 'another-worker'}}),
@@ -356,6 +361,83 @@ test('prefers a matching registered poll, accepts omitted hosts, and limits othe
   assert.deepEqual(observe({...undeclared, cursor: 'earlier'}, strict), observePoll(strict));
   assert.deepEqual(observe(alternateHostPoll, strict), observePoll(strict));
   assert.deepEqual(observe(alternateHostPoll, terminalPoll), observePoll(terminalPoll));
+  assert.deepEqual(observationFromWait({polls: [validAlternate, strict]}, workerRef, 'r', 'evidence', readBackFrom()),
+    observePoll(strict));
+});
+test('a wait tool error stays unconfirmed when the original read fails or belongs to a prior run', () => {
+  const raw = {
+    isError: true,
+    content: [{type: 'text', text: 'tool call error: tool call failed for `codex_app/wait_threads`\n\nCaused by:\n    Mcp error: -32000: Codex app tool request failed'}]
+  };
+  const observe = readBack => observationFromWait(raw, workerRef, 'r', 'wait-evidence', readBack);
+  const lookup = observe();
+  assert.equal(lookup.status, 'unknown');
+  assert.deepEqual(lookup.readThread, {
+    ...workerRef, turnLimit: 1, includeOutputs: false, maxOutputCharsPerItem: 12000
+  });
+
+  const unusableReads = [
+    ['stale run', envelope(readThreadPayload({...completedResult, runId: 'old-run'}))],
+    ['failed read', {isError: true, content: [{type: 'text', text: 'Codex app tool request failed'}]}]
+  ];
+  for (const [label, hostResult] of unusableReads) {
+    const observation = observe(readBackFrom(hostResult));
+    assert.equal(observation.status, 'unknown', label);
+    assert.equal(observation.result, undefined, label);
+    assert.equal(observation.evidenceRef, 'wait-evidence', label);
+    assert.equal(observation.readThread, undefined, label);
+  }
+});
+test('a valid alternate-host summary requires the matching original on the registered worker', () => {
+  const poll = {
+    ...alternateHostPoll,
+    thread: {...terminalPoll.thread, hostId: 'remote-control:env_fixture'},
+    latestAssistantMessage: finalMessage({...completedResult, summary: 'Compact summary'})
+  };
+  const originalResult = {...completedResult, summary: 'Original summary'};
+  const original = readThreadPayload(originalResult);
+  const [turn] = original.turns;
+  const [commentary, message] = turn.items;
+  const unusableReads = [
+    ['wrong thread', {...original, thread: {...original.thread, id: 'another-worker'}}],
+    ['wrong host', {...original, thread: {...original.thread, hostId: poll.thread.hostId}}],
+    ['wrong turn', {...original, turns: [{...turn, id: 'another-turn'}]}],
+    ['wrong message', {...original, turns: [{...turn, items: [commentary, {...message, id: 'another-message'}]}]}]
+  ];
+  for (const [label, hostResult] of unusableReads) {
+    const observation = observePoll(poll, 'wait-evidence', readBackFrom(envelope(hostResult)));
+    assert.equal(observation.status, 'unknown', label);
+    assert.equal(observation.result, undefined, label);
+    assert.equal(observation.evidenceRef, 'wait-evidence', label);
+    assert.equal(observation.readThread, undefined, label);
+  }
+
+  const recovered = observePoll(poll, 'wait-evidence', readBackFrom(envelope(original)));
+  assert.equal(recovered.status, 'completed');
+  assert.deepEqual(recovered.result, {success: true, summary: message.text});
+  assert.equal(recovered.evidenceRef, 'read-evidence');
+});
+test('reads a turn that finishes after the alternate-host snapshot showed commentary', () => {
+  const commentary = {id: 'progress-1', turnId: 'turn-1', phase: 'commentary', text: 'Checking the fixture'};
+  const poll = {
+    ...alternateHostPoll,
+    latestTurn: {...terminalPoll.latestTurn, status: 'inProgress'},
+    latestAssistantMessageId: commentary.id,
+    latestAssistantMessage: commentary
+  };
+  const original = readThreadPayload(completedResult);
+  const lookup = observePoll(poll);
+  assert.equal(lookup.status, 'unknown');
+  assert.equal(lookup.readThread.hostId, workerRef.hostId);
+
+  const recovered = observePoll(poll, 'wait-evidence', readBackFrom(JSON.stringify(original)));
+  assert.equal(recovered.status, 'completed');
+  assert.equal(recovered.evidenceRef, 'read-evidence');
+
+  const latestIsDifferent = {...original, turns: [{...original.turns[0], id: 'turn-2'}]};
+  const unconfirmed = observePoll(poll, 'wait-evidence', readBackFrom(latestIsDifferent));
+  assert.equal(unconfirmed.status, 'unknown');
+  assert.equal(unconfirmed.result, undefined);
 });
 test('recovery event identity follows the message across cursor and host changes', () => {
   const compact = observePoll(compactWindowsPoll);

@@ -235,3 +235,74 @@ test('wait JSON with a collapsed Windows path escape recovers the exact Desktop 
  assert.equal(run('accept', scope).code, 0);
  assert.equal(run('archive', scope).json.hostCall.arguments.archived, true);
 });
+
+const mcpTextResult = payload => ({
+ isError: false, content: [{type: 'text', text: JSON.stringify(payload)}]
+});
+
+const waitRecoveryCases = [
+ ['a wait_threads MCP error', () => ({
+  isError: true,
+  content: [{type: 'text', text: 'tool call error: tool call failed for `codex_app/wait_threads`\n\nCaused by:\n    Mcp error: -32000: Codex app tool request failed'}]
+ })],
+ ['a valid wait poll from a remote-control host', (worker, turn, message, result) => JSON.stringify({
+  polls: [{
+   thread: {...worker, hostId: 'remote-control:env_fixture'},
+   cursor: 'cursor:2',
+   changed: true,
+   latestTurn: turn,
+   latestAssistantMessageId: message.id,
+   latestAssistantMessage: {
+    id: message.id, turnId: turn.id, phase: message.phase,
+    text: JSON.stringify({...result, summary: 'Compact summary'})
+   }
+  }]
+ })]
+];
+
+for (const [source, makeWaitResult] of waitRecoveryCases) {
+ test(`observe recovers from ${source} using the registered worker's original message`, t => {
+  const {run, scope} = boundWorker(t);
+  const worker = {id: 'worker', hostId: 'local', status: {type: 'idle'}};
+  const turn = {id: 'turn-final', status: 'completed', error: null};
+  const result = {
+   runId: scope.runId, status: 'completed', summary: 'Original summary',
+   verification: {status: 'passed', evidenceRefs: ['fixture/worker-evidence.json']}, pendingRequests: []
+  };
+  const message = {id: 'final-message', type: 'agentMessage', phase: 'final_answer', text: JSON.stringify(result)};
+  const input = {...scope, hostResult: makeWaitResult(worker, turn, message, result), evidenceRef: 'fixture/wait.json'};
+
+  const lookup = run('observe', input);
+  assert.equal(lookup.code, 0, JSON.stringify(lookup.json));
+  assert.equal(lookup.json.task.hostStatus, 'unknown');
+  assert.equal(lookup.json.task.result.success, null);
+  assert.equal(lookup.json.needsReconciliation, true);
+  assert.equal(lookup.json.action, null);
+  assert.deepEqual(lookup.json.hostCall, {
+   tool: 'mcp__codex_app__read_thread',
+   arguments: {threadId: 'worker', hostId: 'local', turnLimit: 1, includeOutputs: false, maxOutputCharsPerItem: 12000}
+  });
+
+  const readThreadEvidenceRef = 'fixture/read.json';
+  const restored = run('observe', {
+   ...input,
+   readThreadResult: mcpTextResult({
+    thread: worker,
+    page: {limit: 1, hasMore: true},
+    turns: [{
+     ...turn,
+     items: [{id: 'commentary-message', type: 'agentMessage', phase: 'commentary', text: 'Checking the fixture'}, message]
+    }]
+   }),
+   readThreadEvidenceRef
+  });
+  assert.equal(restored.code, 0, JSON.stringify(restored.json));
+  assert.equal(restored.json.needsReconciliation, false);
+  assert.equal(restored.json.task.hostStatus, 'completed');
+  assert.equal(restored.json.task.phase, 'review');
+  assert.equal(restored.json.task.result.success, true);
+  assert.equal(restored.json.task.result.summary, message.text);
+  assert.equal(restored.json.task.result.evidenceRef, readThreadEvidenceRef);
+  assert.equal(restored.json.hostCall, undefined);
+ });
+}

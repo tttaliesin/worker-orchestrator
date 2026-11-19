@@ -64,9 +64,13 @@ node <설치 루트>/dist/cli.mjs capabilities
 호스트 증거가 없으면 실제 적용 프로필은 미확인으로 남깁니다.
 
 관찰은 `wait_threads`의 커서와 워커의 `threadId`, `hostId`를 보존합니다.
-관련 상세 증거가 필요할 때 `read_thread`를 사용합니다.
+호출 오류가 발생해도 `wait_threads` 응답을 `observe`의 `hostResult`에 전달합니다.
+응답의 근거는 `evidenceRef`에 지정합니다.
+오류 메시지만 받으면 `hostResult`에 `isError: true`를 지정합니다.
+실제 오류 메시지는 그 객체의 `content`에 `type: "text"`인 항목으로 담습니다.
 `observe`가 `read_thread`의 `hostCall`을 반환하면 해당 읽기 전용 호출을 바로 실행합니다.
 같은 `observe` 입력에 실제 조회 응답 `readThreadResult`와 근거 참조 `readThreadEvidenceRef`를 추가해 다시 호출합니다.
+오류 메시지만 남긴 `read_thread` 호출에도 같은 오류 형식을 사용해 조회 실패를 기록합니다.
 원문으로 확인된 결과도 같은 실행의 검증과 채택을 거칩니다.
 승인이나 사용자 입력을 컨트롤러가 대신 처리하지 않습니다.
 `waiting_approval`과 `waiting_input` 상태에서는 보관하지 않습니다.
