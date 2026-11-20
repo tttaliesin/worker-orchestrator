@@ -3,9 +3,9 @@ import { spawnSync } from 'node:child_process';
 import { lstat, mkdir, mkdtemp, open, readFile, readdir, rename, rm, rmdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { isSemVer, withBuildOutputLock } from '../../scripts/check-package.mjs';
+import { isSemVer, withBuildOutputLock } from './check-package.mjs';
 
-const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const portableSchema = 'https://agent-plugins.org/schemas/1.0.0/plugin.schema.json';
 
 function assertNode() {
@@ -107,33 +107,10 @@ function revisionFor(root) {
   return prefix === '' && /^[a-f0-9]{40,64}$/.test(revision) ? revision : null;
 }
 
-function isReleaseTag(tag) {
-  return typeof tag === 'string' && tag.startsWith('v') && isSemVer(tag.slice(1));
-}
-
-function selectReleaseTag(root, revision, tag) {
-  if (tag !== undefined) {
-    if (!isReleaseTag(tag)) throw new Error('--tag must be v followed by valid SemVer.');
-    const ref = gitAt(root, ['show-ref', '--verify', '--hash', `refs/tags/${tag}`]);
-    if (ref.status !== 0) throw new Error(`Release tag does not exist: ${tag}`);
-    const commit = gitAt(root, ['rev-parse', '--verify', `${ref.stdout.trim()}^{commit}`]);
-    if (!revision || commit.status !== 0 || commit.stdout.trim() !== revision) {
-      throw new Error(`Release tag ${tag} must point to the build HEAD.`);
-    }
-    return tag;
-  }
-  if (!revision) return undefined;
-  const git = gitAt(root, ['tag', '--list', '--points-at', revision]);
-  if (git.status !== 0) throw new Error(`Could not list tags at build HEAD: ${git.stderr?.trim() ?? ''}`);
-  const tags = git.stdout.split(/\r?\n/).filter(isReleaseTag);
-  if (tags.length > 1) throw new Error(`Multiple release tags point to build HEAD (${tags.join(', ')}). Select one with --tag.`);
-  return tags[0];
-}
-
 const json = value => `${JSON.stringify(value, null, 2)}\n`;
 
 /** Builds files only; never registers, installs, uploads, or invokes Desktop tools. */
-export async function buildPackage({ repoRoot = repositoryRoot, outputRoot = path.join(repoRoot, 'dist/codex'), tag } = {}) {
+export async function buildPackage({ repoRoot = repositoryRoot, outputRoot = path.join(repoRoot, 'dist/codex') } = {}) {
   assertNode();
   repoRoot = path.resolve(repoRoot);
   outputRoot = path.resolve(outputRoot);
@@ -142,18 +119,17 @@ export async function buildPackage({ repoRoot = repositoryRoot, outputRoot = pat
   if (!relativeOutput || relativeOutput === '..' || relativeOutput.startsWith(`..${path.sep}`) || path.isAbsolute(relativeOutput)) {
     throw new Error('Build output must be a child of the selected repository root.');
   }
-  if (['src', 'workflows', 'builders', 'scripts', 'docs', 'tests'].includes(relativeOutput.split(path.sep)[0])) {
+  if (['src', 'workflows', 'plugin', 'scripts', 'docs', 'tests'].includes(relativeOutput.split(path.sep)[0])) {
     throw new Error('Build output cannot overwrite source directories.');
   }
 
   const metadata = JSON.parse(await readRegular(path.join(repoRoot, 'package.json')));
-  const portable = JSON.parse(await readRegular(path.join(repoRoot, 'builders/codex/plugin.json')));
+  const portable = JSON.parse(await readRegular(path.join(repoRoot, 'plugin/plugin.json')));
   if (portable.$schema !== portableSchema || portable.name !== metadata.name) {
     throw new Error('Portable plugin identity must match package.json.');
   }
   const revision = revisionFor(repoRoot);
-  const releaseTag = selectReleaseTag(repoRoot, revision, tag);
-  const version = releaseTag ? releaseTag.slice(1) : metadata.version;
+  const version = metadata.version;
   if (!isSemVer(version)) throw new Error('Build version must be valid SemVer.');
   portable.version = version;
   const compatibility = {
@@ -166,11 +142,11 @@ export async function buildPackage({ repoRoot = repositoryRoot, outputRoot = pat
   const files = new Map([
     ...await readTree(path.join(repoRoot, 'src'), 'lib'),
     ...await readTree(path.join(repoRoot, 'workflows'), 'workflows'),
-    ...await readTree(path.join(repoRoot, 'builders/codex/skills'), 'skills'),
+    ...await readTree(path.join(repoRoot, 'plugin/skills'), 'skills'),
     ['plugin.json', Buffer.from(json(portable))],
     ['.codex-plugin/plugin.json', Buffer.from(json(compatibility))],
     ['dist/cli.mjs', Buffer.from(`#!/usr/bin/env node\nimport { main } from '../lib/cli/main.mjs';\nprocess.exitCode = main(undefined, ${JSON.stringify(version)});\n`)],
-    ['README.md', await readRegular(path.join(repoRoot, 'builders/codex/README.package.md'))],
+    ['README.md', await readRegular(path.join(repoRoot, 'plugin/README.package.md'))],
     ['scripts/check-package.mjs', await readRegular(path.join(repoRoot, 'scripts/check-package.mjs'))],
   ]);
   for (const name of ['architecture.md', 'usage.md', 'packaging.md']) {
@@ -189,7 +165,6 @@ export async function buildPackage({ repoRoot = repositoryRoot, outputRoot = pat
     name: portable.name,
     version: portable.version,
     revision,
-    ...(releaseTag ? { releaseTag } : {}),
     runtime: { name: 'node', range: metadata.engines.node, builtWith: process.versions.node },
     files: hashes,
   };
@@ -215,11 +190,10 @@ export async function buildPackage({ repoRoot = repositoryRoot, outputRoot = pat
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
   try {
-    const args = process.argv.slice(2);
-    if (args.length && (args.length !== 2 || args[0] !== '--tag')) {
-      throw new Error('Usage: node builders/codex/build.mjs [--tag v<SemVer>]');
+    if (process.argv.length > 2) {
+      throw new Error('Usage: node scripts/build-package.mjs');
     }
-    console.log(json(await buildPackage({ tag: args[1] })).trimEnd());
+    console.log(json(await buildPackage()).trimEnd());
   } catch (error) {
     console.error(JSON.stringify({ ok: false, error: error.message }));
     process.exitCode = 1;

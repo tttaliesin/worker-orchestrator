@@ -4,7 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildPackage } from '../../builders/codex/build.mjs';
+import { buildPackage } from '../../scripts/build-package.mjs';
 
 const repoRoot = realpathSync.native(fileURLToPath(new URL('../../', import.meta.url)));
 const sourceCli = join(repoRoot, 'src', 'cli', 'main.mjs');

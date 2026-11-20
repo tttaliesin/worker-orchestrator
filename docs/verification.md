@@ -14,7 +14,7 @@
 
 ```text
 node --test
-node builders/codex/build.mjs
+node scripts/build-package.mjs
 node scripts/check-package.mjs
 ```
 

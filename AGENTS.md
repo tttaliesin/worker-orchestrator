@@ -9,7 +9,7 @@ Codex 도구 호출은 사용자 권한을 가진 컨트롤러 대화가 수행�
 
 - `src/core`, `src/contracts`, `src/state`는 builder에 독립적입니다.
 - Codex 변환은 `src/adapters/codex-desktop`에 둡니다.
-- `builders/codex`는 공통 구현을 포함하는 독립 설치 패키지를 생성합니다.
+- `scripts/build-package.mjs`는 `plugin/`의 원본과 공통 구현을 독립 설치 패키지로 묶습니다.
 - 승인·사용자 답변 대기 또는 검증 미확인 작업은 자동 보관하지 않습니다.
 - 후속 실행에 이전 검증 통과를 승계하지 않습니다.
 - 사용자 대화 도구와 일시적 subagent 도구를 혼동하지 않습니다.

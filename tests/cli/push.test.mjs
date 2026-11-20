@@ -4,7 +4,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildPackage } from '../../builders/codex/build.mjs';
+import { buildPackage } from '../../scripts/build-package.mjs';
 import { approvalHookFor } from '../../src/adapters/codex-desktop/push.mjs';
 import { publishApproval, readPushEvents } from '../../src/core/push-journal.mjs';
 

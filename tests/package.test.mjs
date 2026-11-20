@@ -7,7 +7,7 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
-import { buildPackage } from '../builders/codex/build.mjs';
+import { buildPackage } from '../scripts/build-package.mjs';
 import { checkPackage } from '../scripts/check-package.mjs';
 import { Orchestrator } from '../src/core/orchestrator.mjs';
 import { createInstallation } from './installed/fixture.mjs';
@@ -164,7 +164,7 @@ test('build preserves foreign output files and checker reports the stale invento
 test('two Node processes can publish to the same initially empty output', async () => {
   const fixture = await installation;
   const outputRoot = path.join(fixture.sandbox, 'parallel', 'catalog');
-  const builder = new URL('../builders/codex/build.mjs', import.meta.url);
+  const builder = new URL('../scripts/build-package.mjs', import.meta.url);
   const script = `
     import { buildPackage } from ${JSON.stringify(builder.href)};
     console.log(JSON.stringify(await buildPackage({ outputRoot: process.argv[1] })));

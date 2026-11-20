@@ -20,7 +20,7 @@ Node.js 24 이상과 기본 제공 SQLite를 사용합니다.
 공유된 소스 저장소에서 다음 명령으로 패키지를 생성하고 검사합니다.
 
 ```text
-node builders/codex/build.mjs
+node scripts/build-package.mjs
 node scripts/check-package.mjs
 node --test
 ```

@@ -214,9 +214,6 @@ async function checkInstalledPackage(root, marketplaceRoot, smoke, stateDir) {
   assert.equal(manifest.formatVersion, 1);
   assert.equal(manifest.name, 'worker-orchestrator');
   assert.ok(isSemVer(manifest.version), 'Manifest version must be valid SemVer.');
-  if (Object.hasOwn(manifest, 'releaseTag')) {
-    assert.equal(manifest.releaseTag, `v${manifest.version}`, 'Manifest release tag must match the version.');
-  }
   assert.ok(manifest.revision === null || /^[a-f\d]{40,64}$/.test(manifest.revision), 'Revision must be a Git object ID or null for no available revision.');
   assert.equal(manifest.runtime?.name, 'node');
   assert.equal(manifest.runtime?.range, '>=24.0.0');
