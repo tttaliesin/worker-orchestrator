@@ -42,6 +42,9 @@ description: Execute a scoped worker assignment and return a structured run resu
 현재 실행과 정확히 일치하는 `runId`를 반드시 최상위 필드에 둡니다.
 최종 응답의 JSON 앞뒤에 설명 문단을 붙이지 않습니다.
 호스트 완료 판정은 이 최상위 `runId`로 현재 실행을 확인합니다.
-컨트롤러에게 자동 메시지를 보내지 않습니다.
+푸시를 위임받은 실행은 종료 결과를 `push-result`로 먼저 영속화합니다.
+반환된 `hostCall`이 이 실행을 배정한 등록 컨트롤러를 가리키면 그 호출을 한 번 실행합니다.
+그 직후 저널에 넣은 것과 동일한 최종 JSON으로 턴을 끝냅니다.
+푸시 권한이 없거나 부족하면 현재 워커 대화의 최종 JSON으로 결과를 전달합니다.
 컨트롤러로 위장하거나 컨트롤러 대신 `record`, `evaluate`, `verify`, `accept`, `archive`를 실행하지 않습니다.
 다른 워커의 생성·전달·복원·보관 도구도 호출하지 않습니다.

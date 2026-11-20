@@ -10,7 +10,7 @@ import { decisionEvidence, isSupportedCheck, nextRetryProfile, object, parseEval
 export { OrchestratorError } from '../contracts/errors.mjs';
 
 const COMMANDS = new Set(['candidate', 'project', 'sync-project', 'dispatch', 'record', 'observe', 'resolve',
-  'evaluate', 'verify', 'accept', 'archive', 'status']);
+  'evaluate', 'verify', 'accept', 'archive', 'status', 'push-config', 'push-inbox', 'push-ack', 'push-observe']);
 const PERMISSIONS = {
   create: 'createWorkers', send: 'sendFollowups',
   archive: 'archiveCompleted', unarchive: 'restoreWorkers',
@@ -26,6 +26,19 @@ function workerRef(value, name = 'workerRef') {
 
 function sameWorker(left, right) {
   return left?.threadId === right?.threadId && left?.hostId === right?.hostId;
+}
+
+export function pushEventRouteReason(project, task, event) {
+  if (event.projectId !== project.projectId || event.hostId !== project.controllerRef.hostId
+    || event.workerThreadId === project.controllerRef.threadId) return 'INCOMPATIBLE_EVENT';
+  if (!task?.workerRef || task.phase === 'planned'
+    || (task.pendingAction && task.pendingAction.type !== 'archive')) return 'WORKER_PENDING';
+  if (task.workerRef.threadId !== event.workerThreadId || task.workerRef.hostId !== event.hostId
+    || task.workerHostProjectId !== project.hostProjectId) return 'WORKER_MISMATCH';
+  if (task.pushEnabled !== true || !Number.isFinite(Date.parse(task.runStartedAt))
+    || !(Date.parse(event.createdAt) >= Date.parse(task.runStartedAt))
+    || (event.kind === 'result' && (task.taskId !== event.taskId || task.runId !== event.runId))) return 'RUN_MISMATCH';
+  return null;
 }
 
 function profile(value) {
@@ -74,6 +87,10 @@ export class Orchestrator {
       const project = this.store.project(projectId);
       check(project, 'PROJECT_NOT_FOUND', `Project is not registered: ${projectId}`);
       if (command === 'sync-project') return this.syncProject(project, payload, caller);
+      if (['push-config', 'push-inbox', 'push-ack', 'push-observe'].includes(command)) {
+        this.requirePushController(project, caller, { removingHook: command === 'push-config' && payload.remove === true });
+        return ['push-inbox', 'push-observe'].includes(command) ? { project, tasks: this.store.tasks(projectId) } : { project };
+      }
       if (command === 'status') {
         if (payload.taskId === undefined && payload.actionId === undefined) {
           return { project, tasks: this.store.tasks(projectId) };
@@ -90,14 +107,30 @@ export class Orchestrator {
       text(payload.taskId, 'taskId');
       if (command === 'dispatch') {
         if (payload.workSpec !== undefined) this.requireController(project, caller);
-        return this.dispatch(project, payload);
+        const pushEnabled = this.canPush(project, caller);
+        return this.withPushAction(this.dispatch(project, payload, pushEnabled), pushEnabled);
       }
       const task = this.getTask(projectId, payload.taskId);
       if (task.workSpec || command === 'evaluate') this.requireController(project, caller);
-      if (command === 'record') return this.record(project, task, payload);
-      if (command === 'evaluate') return this.evaluate(project, task, payload);
+      if (command === 'record') {
+        return this.withPushAction(this.record(project, task, payload), task.pushEnabled && this.canPush(project, caller));
+      }
+      if (command === 'evaluate') {
+        const pushEnabled = this.canPush(project, caller);
+        return this.withPushAction(this.evaluate(project, task, payload, pushEnabled), pushEnabled);
+      }
       this.currentRun(task, text(payload.runId, 'runId'));
-      if (command === 'observe') return this.observe(project, task, payload);
+      if (command === 'observe') {
+        if (payload.pushEvent !== undefined) {
+          this.requirePushController(project, caller);
+          const event = object(payload.pushEvent, 'pushEvent');
+          const reason = pushEventRouteReason(project, task, event);
+          check(!reason, reason, 'The push event no longer belongs to the bound worker and current run.');
+          check(payload.eventId === event.eventId && payload.hostTurnId === event.workerTurnId,
+            'INCOMPATIBLE_EVENT', 'The observation must match the push event and worker turn.');
+        }
+        return this.observe(project, task, payload);
+      }
       if (command === 'resolve') return this.resolve(project, task, payload);
       if (command === 'verify' || command === 'accept') {
         check(!task.workSpec, 'STRUCTURED_EVALUATION_REQUIRED', 'Use evaluate for a run with a workSpec.');
@@ -170,6 +203,8 @@ export class Orchestrator {
     }
     check(authorization.scope === undefined || authorization.scope === 'project', 'INVALID_AUTHORIZATION',
       'authorization.scope must be project when specified.');
+    check(authorization.pushEvents === undefined || typeof authorization.pushEvents === 'boolean',
+      'INVALID_AUTHORIZATION', 'authorization.pushEvents must be a boolean when specified.');
     const prior = this.store.project(projectId);
     if (authorization.scope === 'project' || prior?.authorization.scope === 'project') {
       this.requireController(prior, caller);
@@ -195,6 +230,7 @@ export class Orchestrator {
       authorization: {
         ...Object.fromEntries([...Object.values(PERMISSIONS), 'source'].map(key => [key, authorization[key]])),
         ...(authorization.scope === 'project' ? { scope: 'project' } : {}),
+        ...(authorization.pushEvents !== undefined ? { pushEvents: authorization.pushEvents } : {}),
       },
       createdAt: prior?.createdAt ?? now, updatedAt: now,
     };
@@ -260,6 +296,34 @@ export class Orchestrator {
     'CONTROLLER_REQUIRED', 'Project operation permissions require the registered controller conversation.');
   }
 
+  requirePushController(project, caller, { removingHook = false } = {}) {
+    this.requireController(project, caller);
+    check((caller.hostId ?? 'local') === project.controllerRef.hostId,
+      'CONTROLLER_REQUIRED', 'The current host must match the registered controller host.');
+    check(caller.projectRoots?.includes(project.projectRoot),
+      'PROJECT_SCOPE_MISMATCH', 'The current checkout must belong to the registered project.');
+    check(removingHook || (project.authorization.scope === 'project' && project.authorization.pushEvents === true),
+      'AUTHORIZATION_REQUIRED', 'Project delegation and explicit pushEvents authorization are required.');
+  }
+
+  canPush(project, caller) {
+    return project.authorization.scope === 'project' && project.authorization.pushEvents === true
+      && caller?.threadId === project.controllerRef.threadId
+      && (caller.hostId ?? 'local') === project.controllerRef.hostId
+      && caller.projectRoots?.includes(project.projectRoot) === true;
+  }
+
+  withPushAction(result, authorized) {
+    const { action, project, task } = result;
+    if (!authorized || !task.pushEnabled || !['create', 'send'].includes(action?.type)) return result;
+    const { projectRoot, projectId, controllerRef, authorization } = project;
+    const { taskId, runId } = task;
+    return { ...result, action: { ...action, push: {
+      projectRoot, projectId, taskId, runId, hostId: controllerRef.hostId, controllerRef,
+      authorizationSource: authorization.source,
+    } } };
+  }
+
   authorize(project, type) {
     const permission = PERMISSIONS[type];
     check(project.authorization[permission] === true,
@@ -307,7 +371,7 @@ export class Orchestrator {
     return action;
   }
 
-  dispatch(project, input) {
+  dispatch(project, input, pushEnabled) {
     const requestId = text(input.requestId, 'requestId');
     const prompt = text(input.prompt, 'prompt');
     const requestedProfile = profile(input.profile);
@@ -349,11 +413,12 @@ export class Orchestrator {
     if (actionType === 'unarchive') this.authorize(project, actionType);
     return this.startRun(project, task, {
       ...input, requestId, prompt, requestedProfile, workSpec, runId: randomUUID(),
+      pushEnabled: pushEnabled && (!task?.workerRef || task.workerHostProjectId === project.hostProjectId),
     }, actionType, input);
   }
 
   startRun(project, prior, run, actionType, historyInput) {
-    const { runId, requestId, prompt, requestedProfile, workSpec, retryContext } = run;
+    const { runId, requestId, prompt, requestedProfile, workSpec, retryContext, pushEnabled } = run;
     const now = new Date().toISOString();
     const task = {
       projectId: project.projectId, taskId: run.taskId, runId, requestId, prompt,
@@ -362,6 +427,7 @@ export class Orchestrator {
       ...(prior?.workerHostProjectId != null ? { workerHostProjectId: prior.workerHostProjectId } : {}),
       ...(workSpec && { workSpec }),
       ...(retryContext && { retryContext }),
+      ...(pushEnabled && { pushEnabled: true, runStartedAt: now }),
       archived: prior?.archived ?? false, phase: 'planned', hostStatus: null,
       pendingAction: null, needsReconciliation: false,
       verification: unverified(runId), accepted: false, resultReviewed: false,
@@ -469,6 +535,8 @@ export class Orchestrator {
         'The observation ID already belongs to a different run of this task.');
       return this.response(project, task, false);
     }
+    check(input.pushEvent?.kind !== 'approval' || task.phase !== 'review',
+      'RUN_FINISHED', 'A pushed approval cannot change a run with an observed terminal result.');
     check(task.phase !== 'complete' && task.phase !== 'rejected', 'RUN_FINISHED',
       'An accepted or rejected run is immutable.');
     check(!task.pendingAction && task.phase !== 'planned',
@@ -539,6 +607,7 @@ export class Orchestrator {
       if (resolved && (!anonymous || previousHostStatus !== 'running')) continue;
       const id = resolved ? randomUUID() : sourceId;
       task.waits.push({ id, waitId: id, kind, runId: task.runId, evidenceRef: input.evidenceRef,
+        ...(input.pushEvent?.kind === 'approval' && kind === 'approval' ? { workerTurnId: input.hostTurnId } : {}),
         ...(anonymous ? { sourceWaitId: sourceId } : {}) });
     }
   }
@@ -570,7 +639,7 @@ export class Orchestrator {
     return JSON.parse(row.json);
   }
 
-  evaluate(project, task, input) {
+  evaluate(project, task, input, pushEnabled) {
     const runId = text(input.runId, 'runId');
     if (runId !== task.runId) {
       const row = this.store.db.prepare('SELECT json FROM requests WHERE project_id = ? AND task_id = ? AND run_id = ?')
@@ -598,7 +667,7 @@ export class Orchestrator {
     if (outstanding.length === 0 && task.hostStatus === 'completed' && task.result?.success === true) {
       return this.completeEvaluation(project, task, review, { ...decision, type: 'complete' });
     }
-    return this.evaluateRetry(project, task, review, decision, outstanding);
+    return this.evaluateRetry(project, task, review, decision, outstanding, pushEnabled);
   }
 
   evaluationBlockers(task, diagnostics) {
@@ -617,7 +686,7 @@ export class Orchestrator {
     return reasons;
   }
 
-  evaluateRetry(project, task, review, decision, outstanding) {
+  evaluateRetry(project, task, review, decision, outstanding, pushEnabled) {
     const reasons = [];
     if (outstanding.length) reasons.push('CRITERIA_NOT_MET');
     if (task.result?.success !== true) reasons.push('RESULT_NOT_SUCCESSFUL');
@@ -640,7 +709,7 @@ export class Orchestrator {
       checks: outstanding, constraintReview: decision.diagnostics.constraintReview, reasons };
     const response = this.startRun(project, task, {
       taskId: task.taskId, runId: nextRunId, requestId, prompt: task.prompt,
-      requestedProfile, workSpec: task.workSpec, retryContext,
+      requestedProfile, workSpec: task.workSpec, retryContext, pushEnabled: task.pushEnabled && pushEnabled,
     }, 'send', { source: 'evaluate', previousRunId: task.runId, resultEventId: decision.resultEventId, requestId });
     return { ...response, decision: retry };
   }
